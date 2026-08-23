@@ -30,6 +30,18 @@ bun install
 
 That's it. That's the install. If it doesn't work, it's almost certainly a Tauri/Rust toolchain problem, not a `bun` problem — check the prerequisites link above before opening an issue about it.
 
+## Downloading the macOS build
+
+If you grabbed a `.dmg` from the [releases page](https://github.com/MarvinPahling/can-tool/releases/latest) instead of building it yourself, congratulations, you've discovered that we don't sign or notarize anything. Apple has opinions about that. macOS will let you download the DMG, mount it, drag the app into `Applications`, and then flatly refuse to open it — no "Open Anyway" button, no dialog with an escape hatch, just a vague sense that your computer doesn't trust you. This is correct; your computer is very perceptive.
+
+The fix, since Apple removed the polite GUI way of doing this:
+
+```bash
+xattr -cr "/Applications/can-tool.app"
+```
+
+This strips the quarantine flag Gatekeeper slapped on it during download, and the app will open like nothing ever happened. Is this "training yourself to run arbitrary unsigned binaries from the internet by disabling a security feature"? Yes. Are we going to fix it by paying Apple $99/year for a Developer ID and wiring up notarization in CI? Also yes, eventually, probably, once the vibes align.
+
 ## Running it
 
 ```bash
