@@ -1,7 +1,7 @@
 import type { Ref } from "react";
 import { ChevronRight } from "lucide-react";
 import { useTable } from "@tanstack/react-table";
-import type { DbcFile } from "@/api/dbc";
+import type { DbcFile, DbcMessage, DbcSignal } from "@/api/dbc";
 import {
   Table,
   TableBody,
@@ -22,6 +22,8 @@ export function DbcTable({
   globalFilter,
   onGlobalFilterChange,
   filterInputRef,
+  hoveredSignal,
+  onSignalHover,
 }: {
   dbc: DbcFile;
   /** Owned by the route (synced to the URL `q` search param), not by the table. */
@@ -29,6 +31,9 @@ export function DbcTable({
   onGlobalFilterChange: (value: string) => void;
   /** Exposed so the route can focus it for the "table.focusFilter" command ("G F"). */
   filterInputRef?: Ref<HTMLInputElement>;
+  /** Signal currently hovered, for row highlighting. */
+  hoveredSignal?: DbcSignal | null;
+  onSignalHover?: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
   const data = buildDbcRows(dbc);
 
@@ -97,7 +102,22 @@ export function DbcTable({
         </TableHeader>
         <TableBody>
           {table.getRowModel().rows.map((row) => (
-            <TableRow key={row.id} className={cn(row.original.kind === "signal" && "bg-muted/20")}>
+            <TableRow
+              key={row.id}
+              className={cn(
+                row.original.kind === "signal" && "bg-muted/20",
+                row.original.kind === "signal" &&
+                  row.original.signal === hoveredSignal &&
+                  "bg-accent",
+              )}
+              onMouseEnter={() =>
+                row.original.kind === "signal" &&
+                onSignalHover?.(row.original.signal, row.original.message)
+              }
+              onMouseLeave={() =>
+                row.original.kind === "signal" && onSignalHover?.(null)
+              }
+            >
               {row.getAllCells().map((cell) => (
                 <TableCell key={cell.id}>
                   {cell.column.id === "expander" ? (

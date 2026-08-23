@@ -3,12 +3,16 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X, Keyboard } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { runCommand } from "@/commands";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { runCommand, useCommandHandler } from "@/commands";
+import { cycleTheme } from "@/lib/theme";
 
 const appWindow = getCurrentWindow();
 
 export function Titlebar() {
   const [isMaximized, setIsMaximized] = useState(false);
+
+  useCommandHandler("app.toggleTheme", cycleTheme);
 
   useEffect(() => {
     appWindow.isMaximized().then(setIsMaximized);
@@ -29,6 +33,7 @@ export function Titlebar() {
         <span className="text-xs font-medium text-sidebar-foreground">client</span>
       </div>
       <div className="flex h-full items-center">
+        <ThemeToggle />
         <Button
           variant="ghost"
           size="icon"

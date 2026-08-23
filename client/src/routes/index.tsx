@@ -14,9 +14,9 @@ import {
 } from "@/components/ui/select";
 import { DbcSummary } from "@/components/dbc-summary";
 import { DbcTable } from "@/components/dbc-table";
-import { DbcSignalLayoutChart } from "@/components/dbc-signal-layout-chart";
+import { SignalBitGrid } from "@/components/signal-bit-grid";
 import { useParseDbcFile } from "@/queries/dbc";
-import type { DbcMessage } from "@/api/dbc";
+import type { DbcMessage, DbcSignal } from "@/api/dbc";
 import { cn } from "@/lib/utils";
 import { formatBinding, useCommandHandler, useEffectiveBinding, useScope } from "@/commands";
 
@@ -36,6 +36,12 @@ function HomeComponent() {
   const filterInputRef = useRef<HTMLInputElement>(null);
   const openBinding = useEffectiveBinding("file.open");
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
+  const [hoveredSignal, setHoveredSignal] = useState<DbcSignal | null>(null);
+
+  function handleSignalHover(signal: DbcSignal | null, message?: DbcMessage) {
+    setHoveredSignal(signal);
+    if (signal && message) setSelectedMessageId(String(message.id));
+  }
 
   async function handleOpenDbcFile() {
     const path = await open({
@@ -56,7 +62,7 @@ function HomeComponent() {
   useCommandHandler("table.focusFilter", () => filterInputRef.current?.focus());
 
   return (
-    <div className={cn("mx-auto p-8", parseDbcFile.isSuccess ? "max-w-4xl" : "max-w-xl")}>
+    <div className={cn("p-4", !parseDbcFile.isSuccess && "mx-auto max-w-xl")}>
       <h1 className="text-xl font-semibold">CAN Tool</h1>
 
       <div className="mt-6">
@@ -79,26 +85,34 @@ function HomeComponent() {
         {parseDbcFile.isSuccess && (
           <div className="mt-3 space-y-4">
             <DbcSummary dbc={parseDbcFile.data} />
-            {parseDbcFile.data.messages.length > 0 && (
-              <SignalLayoutSection
-                messages={parseDbcFile.data.messages}
-                selectedMessageId={selectedMessageId}
-                onSelectMessageId={setSelectedMessageId}
-              />
-            )}
-            <DbcTableScope>
-              <DbcTable
-                dbc={parseDbcFile.data}
-                globalFilter={q}
-                onGlobalFilterChange={(value) =>
-                  navigate({
-                    search: (prev) => ({ ...prev, q: value || undefined }),
-                    replace: true,
-                  })
-                }
-                filterInputRef={filterInputRef}
-              />
-            </DbcTableScope>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_420px] lg:items-start">
+              <DbcTableScope>
+                <DbcTable
+                  dbc={parseDbcFile.data}
+                  globalFilter={q}
+                  onGlobalFilterChange={(value) =>
+                    navigate({
+                      search: (prev) => ({ ...prev, q: value || undefined }),
+                      replace: true,
+                    })
+                  }
+                  filterInputRef={filterInputRef}
+                  hoveredSignal={hoveredSignal}
+                  onSignalHover={handleSignalHover}
+                />
+              </DbcTableScope>
+              {parseDbcFile.data.messages.length > 0 && (
+                <div className="lg:sticky lg:top-4">
+                  <SignalLayoutSection
+                    messages={parseDbcFile.data.messages}
+                    selectedMessageId={selectedMessageId}
+                    onSelectMessageId={setSelectedMessageId}
+                    hoveredSignal={hoveredSignal}
+                    onSignalHover={handleSignalHover}
+                  />
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -116,13 +130,20 @@ function SignalLayoutSection({
   messages,
   selectedMessageId,
   onSelectMessageId,
+  hoveredSignal,
+  onSignalHover,
 }: {
   messages: DbcMessage[];
   selectedMessageId: string | null;
   onSelectMessageId: (id: string) => void;
+  hoveredSignal: DbcSignal | null;
+  onSignalHover: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
   const selectedMessage =
     messages.find((message) => String(message.id) === selectedMessageId) ?? messages[0];
+  const hoveredSignalInMessage = selectedMessage.signals.includes(hoveredSignal as DbcSignal)
+    ? hoveredSignal
+    : null;
 
   return (
     <div className="space-y-3">
@@ -143,7 +164,11 @@ function SignalLayoutSection({
           ))}
         </SelectContent>
       </Select>
-      <DbcSignalLayoutChart message={selectedMessage} />
+      <SignalBitGrid
+        message={selectedMessage}
+        hoveredSignal={hoveredSignalInMessage}
+        onSignalHover={(signal) => onSignalHover(signal, selectedMessage)}
+      />
     </div>
   );
 }

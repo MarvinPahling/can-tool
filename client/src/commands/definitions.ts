@@ -25,6 +25,12 @@ export const COMMANDS = [
     description: "Show all shortcuts and let you customize them",
     defaultBinding: "Mod+/",
   },
+  {
+    id: "app.toggleTheme",
+    label: "Toggle Theme",
+    description: "Cycle between light, dark, and system theme",
+    defaultBinding: "Mod+Shift+L",
+  },
 ] as const;
 
 // Type-only check: keeps each command's literal id/binding types (for
