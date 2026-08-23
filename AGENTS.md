@@ -33,6 +33,16 @@ Other useful commands (no justfile target yet):
 
 Test reports (junit XML + HTML, gitignored) land under `test-results/` — `frontend-junit.xml`/`frontend-html/` from vitest, `backend/junit.xml` from `just test-report`'s nextest run.
 
+## Workflow: TDD for new features
+
+New features and bug fixes are implemented test-first, not test-after:
+
+1. **Write a test first** for the behavior you're about to add or fix — a frontend unit test (`*.test.ts(x)` colocated next to the source file, see "Commands" above for conventions) or a Rust `#[cfg(test)] mod tests` block (colocated in the module, e.g. `dbc.rs`, `can.rs`). The test should fail (or fail to compile) at this point, since the behavior doesn't exist yet.
+2. **Implement** the minimal code to make it pass.
+3. **Verify by running the test through `just`** — `just test-frontend` or `just test-backend` for a quick loop on one side, `just test` for both. Don't declare the feature done until the new test (and the rest of the suite) is green.
+
+This applies to both sides of the stack: a new `#[tauri::command]` gets its Rust-side logic covered by a backend test before/alongside the command itself; a new pure function in `src/lib/` or `src/commands/` gets a frontend test first. Purely presentational/layout changes with no testable logic are the exception — use judgment, but default to writing the test first.
+
 ## Architecture
 
 ### End-to-end type safety via tauri-typegen
