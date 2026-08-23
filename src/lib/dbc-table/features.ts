@@ -1,11 +1,9 @@
 import {
 	columnFilteringFeature,
-	createExpandedRowModel,
 	createFilteredRowModel,
 	createSortedRowModel,
 	filterFn_includesString,
 	globalFilteringFeature,
-	rowExpandingFeature,
 	rowSortingFeature,
 	sortFn_alphanumeric,
 	sortFn_text,
@@ -14,16 +12,14 @@ import {
 
 /**
  * The full set of feature plugins, row-model factories, and fn registries the
- * DBC grid needs: row expanding (message -> signal sub-rows), global text
- * filtering, and column sorting. Declared once, statically, per the v9
- * headless pattern — never recreated per render.
+ * DBC grid needs: global text filtering and column sorting. Message/signal
+ * expansion is resolved before rows reach the table (see `buildDbcRows`)
+ * rather than through the table's own row-expanding feature.
  */
 export const dbcTableFeatures = tableFeatures({
-	rowExpandingFeature,
 	columnFilteringFeature,
 	globalFilteringFeature,
 	rowSortingFeature,
-	expandedRowModel: createExpandedRowModel(),
 	filteredRowModel: createFilteredRowModel(),
 	sortedRowModel: createSortedRowModel(),
 	filterFns: { includesString: filterFn_includesString },

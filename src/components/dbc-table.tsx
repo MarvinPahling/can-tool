@@ -1,6 +1,7 @@
 import { useTable } from "@tanstack/react-table";
 import { ChevronRight } from "lucide-react";
 import type { Ref } from "react";
+import { useMemo, useState } from "react";
 import type { DbcFile, DbcMessage, DbcSignal } from "@/api/dbc";
 import { Input } from "@/components/ui/input";
 import {
@@ -14,7 +15,7 @@ import {
 } from "@/components/ui/table";
 import { dbcColumns } from "@/lib/dbc-table/columns";
 import { dbcTableFeatures } from "@/lib/dbc-table/features";
-import { buildDbcRows, type DbcRow, getDbcSubRows } from "@/lib/dbc-table/rows";
+import { buildDbcRows, type DbcRow } from "@/lib/dbc-table/rows";
 import { useRequestSendMessage } from "@/lib/pending-send";
 import { cn } from "@/lib/utils";
 
@@ -41,14 +42,34 @@ export function DbcTable({
 	hoveredSignal?: DbcSignal | null;
 	onSignalHover?: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
-	const data = buildDbcRows(dbc);
 	const requestSendMessage = useRequestSendMessage();
+	// Which messages are showing their signal rows. Resolved into the row list
+	// ourselves (see `buildDbcRows`) rather than via the table's row-expanding
+	// feature, whose expanded state doesn't reliably stick across re-renders.
+	const [expandedMessageIds, setExpandedMessageIds] = useState<Set<number>>(
+		() => new Set(dbc.messages.map((message) => message.id)),
+	);
+	const data = useMemo(
+		() => buildDbcRows(dbc, expandedMessageIds),
+		[dbc, expandedMessageIds],
+	);
+
+	function toggleMessageExpanded(messageId: number) {
+		setExpandedMessageIds((old) => {
+			const next = new Set(old);
+			if (next.has(messageId)) {
+				next.delete(messageId);
+			} else {
+				next.add(messageId);
+			}
+			return next;
+		});
+	}
 
 	const table = useTable({
 		features: dbcTableFeatures,
 		columns: dbcColumns,
 		data,
-		getSubRows: getDbcSubRows,
 		getRowId: (row: DbcRow) => row.id,
 		state: { globalFilter },
 		onGlobalFilterChange: (updater) =>
@@ -56,7 +77,6 @@ export function DbcTable({
 				typeof updater === "function" ? updater(globalFilter) : updater,
 			),
 		globalFilterFn: "includesString",
-		initialState: { expanded: true },
 	});
 
 	return (
@@ -117,6 +137,7 @@ export function DbcTable({
 							key={row.id}
 							title={`${modKeyLabel}-click to send this message`}
 							className={cn(
+								row.original.kind === "message" && "bg-primary/5",
 								row.original.kind === "signal" && "bg-muted/20",
 								row.original.kind === "signal" &&
 									row.original.signal === hoveredSignal &&
@@ -138,20 +159,27 @@ export function DbcTable({
 							{row.getAllCells().map((cell) => (
 								<TableCell key={cell.id}>
 									{cell.column.id === "expander" ? (
-										row.getCanExpand() ? (
+										row.original.kind === "message" ? (
 											<button
 												type="button"
-												onClick={row.getToggleExpandedHandler()}
-												aria-expanded={row.getIsExpanded()}
+												onClick={() =>
+													toggleMessageExpanded(row.original.message.id)
+												}
+												aria-expanded={expandedMessageIds.has(
+													row.original.message.id,
+												)}
 												aria-label={
-													row.getIsExpanded() ? "Collapse row" : "Expand row"
+													expandedMessageIds.has(row.original.message.id)
+														? "Collapse row"
+														: "Expand row"
 												}
 												className="text-muted-foreground hover:text-foreground"
 											>
 												<ChevronRight
 													className={cn(
 														"size-3.5 transition-transform",
-														row.getIsExpanded() && "rotate-90",
+														expandedMessageIds.has(row.original.message.id) &&
+															"rotate-90",
 													)}
 												/>
 											</button>
