@@ -1,7 +1,9 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useSuspenseQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { z } from "zod";
-import { ALL_TAGS, fetchPosts } from "../../api/posts";
+import { ALL_TAGS } from "../../api/posts";
+import { postsQueryOptions, useCreatePost, useDeletePost } from "../../queries/posts";
 
 const postsSearchSchema = z.object({
   q: z.string().optional().catch("").default(""),
@@ -14,7 +16,10 @@ const PAGE_SIZE = 3;
 export const Route = createFileRoute("/posts/")({
   validateSearch: postsSearchSchema,
   loaderDeps: ({ search }) => ({ q: search.q, tag: search.tag, page: search.page }),
-  loader: async ({ deps }) => fetchPosts({ q: deps.q, tag: deps.tag }),
+  loader: ({ context: { queryClient }, deps }) =>
+    // Populates the Query cache before render; a second navigation to the
+    // same filters reuses the cache instead of re-fetching.
+    queryClient.ensureQueryData(postsQueryOptions({ q: deps.q, tag: deps.tag })),
   pendingComponent: PostsPending,
   errorComponent: PostsError,
   component: PostsComponent,
@@ -67,18 +72,76 @@ function SearchInput({
   );
 }
 
+function NewPostForm() {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [tag, setTag] = useState<(typeof ALL_TAGS)[number]>("note");
+  const createPost = useCreatePost();
+
+  return (
+    <form
+      className="new-post"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!title.trim()) return;
+        createPost.mutate(
+          { title, body, tag },
+          {
+            onSuccess: () => {
+              setTitle("");
+              setBody("");
+            },
+          },
+        );
+      }}
+    >
+      <input
+        placeholder="Title (contains 'fail' to test rollback)"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+      />
+      <input placeholder="Body" value={body} onChange={(e) => setBody(e.target.value)} />
+      <select value={tag} onChange={(e) => setTag(e.target.value as typeof tag)}>
+        {ALL_TAGS.map((t) => (
+          <option key={t} value={t}>
+            {t}
+          </option>
+        ))}
+      </select>
+      <button type="submit" disabled={createPost.isPending || !title.trim()}>
+        {createPost.isPending ? "Adding…" : "Add post"}
+      </button>
+      {createPost.isError && (
+        <p className="error">Couldn't add post: {createPost.error.message}</p>
+      )}
+    </form>
+  );
+}
+
 function PostsComponent() {
-  const posts = Route.useLoaderData();
   const { q, tag, page } = Route.useSearch();
   const navigate = Route.useNavigate();
+
+  const { data: posts, isFetching, dataUpdatedAt } = useSuspenseQuery(
+    postsQueryOptions({ q, tag }),
+  );
+  const deletePost = useDeletePost();
 
   const start = (page - 1) * PAGE_SIZE;
   const pageItems = posts.slice(start, start + PAGE_SIZE);
   const pageCount = Math.max(1, Math.ceil(posts.length / PAGE_SIZE));
+  const isStale = Date.now() - dataUpdatedAt > 30_000;
 
   return (
     <div className="page">
-      <h1>Posts</h1>
+      <h1>
+        Posts {isFetching && <span className="muted refresh-indicator">refreshing…</span>}
+      </h1>
+      {isStale && !isFetching && (
+        <p className="muted stale-note">Showing cached results — they may be out of date.</p>
+      )}
+
+      <NewPostForm />
 
       <div className="filters">
         <SearchInput
@@ -117,14 +180,17 @@ function PostsComponent() {
         <ul className="post-list">
           {pageItems.map((post) => (
             <li key={post.id}>
-              <Link
-                to="/posts/$postId"
-                params={{ postId: post.id }}
-                preload="intent"
-              >
+              <Link to="/posts/$postId" params={{ postId: post.id }} preload="intent">
                 {post.title}
               </Link>{" "}
-              <span className="tag">{post.tag}</span>
+              <span className="tag">{post.tag}</span>{" "}
+              <button
+                className="delete-btn"
+                onClick={() => deletePost.mutate(post.id)}
+                disabled={deletePost.isPending}
+              >
+                Delete
+              </button>
             </li>
           ))}
         </ul>
