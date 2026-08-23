@@ -4,12 +4,17 @@
 # with no internet access and no WebView2 already installed, which is required
 # for the offline/enterprise release bundle.
 #
-# The runtime is pulled from the official Microsoft.Web.WebView2 NuGet package
-# (a stable, versioned source) rather than the evergreen bootstrapper, so the
-# bundled runtime is pinned and reproducible across local and CI builds.
+# Microsoft does not publish the fixed version runtime .cab as part of the
+# Microsoft.Web.WebView2 NuGet package (that package only ships the loader
+# DLL/headers) or behind any stable, scriptable URL -- the .cab is only
+# available through the JS-driven download page at
+# https://developer.microsoft.com/microsoft-edge/webview2/. We instead pull it
+# from westinyang/WebView2RuntimeArchive, a GitHub release mirror of the same
+# Microsoft-published .cab files, keyed by runtime build number, which is what
+# other Tauri projects (e.g. clash-verge-rev) use in CI for the same reason.
 
 param(
-	[string]$Version = "130.0.2849.68",
+	[string]$Version = "130.0.2849.80",
 	[string]$Arch = "x64",
 	[string]$OutDir = (Join-Path $PSScriptRoot "../src-tauri/WebView2Runtime")
 )
@@ -21,29 +26,21 @@ $work = Join-Path ([System.IO.Path]::GetTempPath()) "webview2-fixed-$Version-$Ar
 if (Test-Path $work) { Remove-Item -Recurse -Force $work }
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-$nupkgPath = Join-Path $work "webview2.zip"
-$nupkgUrl = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/$Version"
+$cabName = "Microsoft.WebView2.FixedVersionRuntime.$Version.$Arch.cab"
+$cabPath = Join-Path $work $cabName
+$cabUrl = "https://github.com/westinyang/WebView2RuntimeArchive/releases/download/$Version/$cabName"
 
-Write-Host "Downloading Microsoft.Web.WebView2 $Version..."
-Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkgPath
-
-Write-Host "Extracting NuGet package..."
-Expand-Archive -Path $nupkgPath -DestinationPath $work -Force
-
-$cabDir = Join-Path $work "runtimes/win-$Arch/nativeassets"
-$cab = Get-ChildItem -Path $cabDir -Filter "Microsoft.WebView2.FixedVersionRuntime.*.cab" -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $cab) {
-	throw "Could not find a fixed version runtime .cab for arch '$Arch' in Microsoft.Web.WebView2 $Version"
-}
+Write-Host "Downloading $cabName..."
+Invoke-WebRequest -Uri $cabUrl -OutFile $cabPath
 
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 Write-Host "Expanding runtime cab archive..."
-expand.exe $cab.FullName -F:* $OutDir | Out-Null
+expand.exe $cabPath -F:* $OutDir | Out-Null
 
 # The cab contains a single top-level folder named after the runtime version
-# (e.g. "130.0.2849.68/..."); tauri expects the runtime files directly inside
+# (e.g. "130.0.2849.80/..."); tauri expects the runtime files directly inside
 # $OutDir, so flatten that one level if present.
 $versionedDir = Get-ChildItem -Path $OutDir -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($versionedDir) {
