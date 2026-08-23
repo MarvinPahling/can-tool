@@ -38,7 +38,7 @@ pub fn run() {
             // bold application menu (named after the app, holding About/Quit/etc)
             // regardless of what it's titled — so it must come before "File" or
             // "File" gets swallowed into it.
-            let app_menu = SubmenuBuilder::new(handle, "client")
+            let app_menu = SubmenuBuilder::new(handle, "CAN Tool")
                 .item(&PredefinedMenuItem::about(handle, None, None)?)
                 .separator()
                 .item(&PredefinedMenuItem::services(handle, None)?)

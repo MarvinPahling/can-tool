@@ -12,5 +12,5 @@ fn main() {
     builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-    client_lib::run()
+    can_tool_lib::run()
 }

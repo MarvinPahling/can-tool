@@ -36,7 +36,7 @@ export function Titlebar() {
 				className="flex h-full flex-1 items-center px-3"
 			>
 				<span className="text-xs font-medium text-sidebar-foreground">
-					client
+					CAN Tool
 				</span>
 			</div>
 			<div className="flex h-full items-center">
