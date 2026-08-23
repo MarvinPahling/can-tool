@@ -44,7 +44,14 @@ There's also `bun run dev` for the frontend alone (Vite only, no Tauri window, n
 
 ## Testing
 
-There isn't any. There is no test runner configured. We are, as previously established, vibing. There is a linter — [Biome](https://biomejs.dev), configured in `biome.json` — so at least run `just lint` (and `tsc` / `cargo check` for type errors) before you commit something embarrassing.
+There is now! Turns out even a vibe-coded app eventually accumulates enough surface area that "seemed fine when I looked at it" stops being a testing strategy. Frontend unit tests run on Vitest + React Testing Library, backend unit tests run on `cargo test`/`cargo nextest`, and both flavors will happily generate junit XML and HTML reports so you can admire your coverage in a browser tab instead of just believing it exists.
+
+```bash
+just test         # frontend (vitest) + backend (cargo test)
+just test-report  # both, plus junit/HTML reports under test-results/
+```
+
+No `just`? `bun run test` and `cargo test --manifest-path src-tauri/Cargo.toml` work fine on their own. There is also a linter — [Biome](https://biomejs.dev), configured in `biome.json` — so run `just lint` (and `tsc` / `cargo check` for type errors) before you commit something embarrassing. The tests won't catch everything the vibes missed, but they'll catch some of it, which is technically an improvement.
 
 ## Linting & pre-commit hooks
 

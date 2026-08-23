@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# test reports
+test-results
+allure-results
+
 # tauri-typegen cache (regenerated bindings in src/generated/ are committed)
 src/generated/.typecache
 

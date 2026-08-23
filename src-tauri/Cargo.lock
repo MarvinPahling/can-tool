@@ -546,6 +546,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-typegen",
+ "tempfile",
 ]
 
 [[package]]

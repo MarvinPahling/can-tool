@@ -6,7 +6,14 @@
 		"useIgnoreFile": true
 	},
 	"files": {
-		"includes": ["**", "!**/dist", "!src/routeTree.gen.ts", "!src/generated"]
+		"includes": [
+			"**",
+			"!**/dist",
+			"!src/routeTree.gen.ts",
+			"!src/generated",
+			"!test-results",
+			"!allure-results"
+		]
 	},
 	"formatter": {
 		"enabled": true,

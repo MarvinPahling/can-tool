@@ -18,14 +18,20 @@ All commands run from the repo root (the justfile assumes this cwd).
 just dev      # bun run tauri dev — full Tauri app window (Rust backend + Vite frontend, hot-reloaded)
 just build    # bun run tauri build — tsc typecheck + vite build + Rust release build, packaged as a desktop app
 just clean    # removes dist/, node_modules/.vite, and cargo-cleans src-tauri
+just test     # frontend (vitest) + backend (cargo test) unit tests
+just test-report  # both suites with junit/html reports collected under test-results/
+just lint     # bunx biome check .
 ```
 
 Other useful commands (no justfile target yet):
 - `bun run dev` / `bun run build` — Vite alone, frontend only (no Tauri window, no Rust backend).
+- `bun run test` / `bun run test:watch` / `bun run test:coverage` — vitest directly (jsdom + React Testing Library, config in `vitest.config.ts`, setup in `src/test/setup.ts`, fixtures in `src/test/fixtures.ts`). Colocated as `*.test.ts(x)` next to the source file.
+- `cargo test --manifest-path src-tauri/Cargo.toml` — Rust unit tests (colocated `#[cfg(test)] mod tests` in each module, e.g. `dbc.rs`, `can.rs`).
+- `cargo nextest run --manifest-path src-tauri/Cargo.toml` — same Rust tests via nextest, which also emits a junit XML report (config in `src-tauri/.config/nextest.toml`); requires `cargo install cargo-nextest`.
 - `cargo check --manifest-path src-tauri/Cargo.toml` — typecheck Rust without a full build.
 - `cargo tauri-typegen generate` — regenerate `src/generated/{types,commands,index}.ts` from the Rust `#[tauri::command]` definitions. Re-run this after adding/changing a Tauri command; it also runs automatically at build time via `build.rs`.
 
-There is no test runner or linter configured yet in `package.json`/Cargo.toml.
+Test reports (junit XML + HTML, gitignored) land under `test-results/` — `frontend-junit.xml`/`frontend-html/` from vitest, `backend/junit.xml` from `just test-report`'s nextest run.
 
 ## Architecture
 

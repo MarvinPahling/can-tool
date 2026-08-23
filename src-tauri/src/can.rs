@@ -350,3 +350,173 @@ pub fn send_can_message(
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
     write_frame(&mut connection.port, message.id, message.extended, &data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal(overrides: impl FnOnce(&mut DbcSignal)) -> DbcSignal {
+        let mut signal = DbcSignal {
+            name: "Signal".to_string(),
+            start_bit: 0,
+            size: 8,
+            little_endian: true,
+            signed: false,
+            factor: 1.0,
+            offset: 0.0,
+            min: 0.0,
+            max: 255.0,
+            unit: String::new(),
+            receivers: Vec::new(),
+            multiplexer: crate::dbc::DbcMultiplexer::Plain,
+        };
+        overrides(&mut signal);
+        signal
+    }
+
+    fn message(signals: Vec<DbcSignal>) -> DbcMessage {
+        DbcMessage {
+            id: 100,
+            extended: false,
+            name: "Message".to_string(),
+            size: 8,
+            transmitter: None,
+            signals,
+        }
+    }
+
+    #[test]
+    fn bitrate_code_maps_known_bitrates() {
+        assert_eq!(bitrate_code(500_000), Ok('6'));
+        assert_eq!(bitrate_code(1_000_000), Ok('8'));
+    }
+
+    #[test]
+    fn bitrate_code_rejects_unknown_bitrates() {
+        assert!(bitrate_code(123_456).is_err());
+    }
+
+    #[test]
+    fn signal_bit_indices_are_contiguous_for_little_endian() {
+        assert_eq!(signal_bit_indices(3, 5, true), vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn signal_bit_indices_wrap_bytes_for_big_endian() {
+        assert_eq!(signal_bit_indices(1, 4, false), vec![1, 0, 15, 14]);
+    }
+
+    #[test]
+    fn signal_range_unsigned_spans_zero_to_max_raw() {
+        let sig = signal(|_| {});
+        assert_eq!(signal_range(&sig), (0.0, 255.0));
+    }
+
+    #[test]
+    fn signal_range_signed_is_twos_complement() {
+        let sig = signal(|s| s.signed = true);
+        assert_eq!(signal_range(&sig), (-128.0, 127.0));
+    }
+
+    #[test]
+    fn signal_range_applies_factor_and_offset() {
+        let sig = signal(|s| {
+            s.factor = 0.5;
+            s.offset = -10.0;
+        });
+        assert_eq!(signal_range(&sig), (-10.0, 255.0 * 0.5 - 10.0));
+    }
+
+    #[test]
+    fn crc8_sae_j1850_matches_known_vector() {
+        // Standard CRC-8/SAE-J1850 test vector: CRC("123456789") == 0x4B.
+        assert_eq!(crc8_sae_j1850(b"123456789"), 0x4B);
+    }
+
+    #[test]
+    fn encode_can_message_packs_a_little_endian_value() {
+        let sig = signal(|s| {
+            s.name = "Val".to_string();
+            s.start_bit = 0;
+            s.size = 16;
+        });
+        let msg = message(vec![sig]);
+        let mut values = HashMap::new();
+        values.insert("Val".to_string(), 258.0); // 0x0102
+
+        let bytes = encode_can_message(msg, values).unwrap();
+        assert_eq!(&bytes[..2], &[0x02, 0x01]);
+    }
+
+    #[test]
+    fn encode_can_message_rejects_out_of_range_physical_value() {
+        let sig = signal(|s| s.name = "Val".to_string());
+        let msg = message(vec![sig]);
+        let mut values = HashMap::new();
+        values.insert("Val".to_string(), 999.0);
+
+        assert!(encode_can_message(msg, values).is_err());
+    }
+
+    #[test]
+    fn encode_can_message_skips_signals_missing_from_the_value_map() {
+        let sig = signal(|s| s.name = "Val".to_string());
+        let msg = message(vec![sig]);
+
+        let bytes = encode_can_message(msg, HashMap::new()).unwrap();
+        assert_eq!(bytes, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn encode_can_message_errors_when_signal_overflows_message() {
+        let sig = signal(|s| {
+            s.name = "Val".to_string();
+            s.start_bit = 0;
+            s.size = 8;
+        });
+        let mut msg = message(vec![sig]);
+        msg.size = 0; // no bytes available to write into
+
+        let mut values = HashMap::new();
+        values.insert("Val".to_string(), 1.0);
+
+        assert!(encode_can_message(msg, values).is_err());
+    }
+
+    #[test]
+    fn generate_checksum_zeroes_the_checksum_signal_before_computing() {
+        let data_sig = signal(|s| {
+            s.name = "Data".to_string();
+            s.start_bit = 0;
+            s.size = 8;
+        });
+        let checksum_sig = signal(|s| {
+            s.name = "Checksum".to_string();
+            s.start_bit = 8;
+            s.size = 8;
+        });
+        let msg = message(vec![data_sig, checksum_sig]);
+
+        let mut values = HashMap::new();
+        values.insert("Data".to_string(), 42.0);
+        // Whatever value the caller had for the checksum should be ignored/overwritten.
+        values.insert("Checksum".to_string(), 200.0);
+
+        let checksum =
+            generate_checksum(msg.clone(), values.clone(), "Checksum".to_string()).unwrap();
+
+        let mut zeroed = values.clone();
+        zeroed.insert("Checksum".to_string(), 0.0);
+        let bytes = encode_can_message(msg, zeroed).unwrap();
+        let expected = crc8_sae_j1850(&bytes) as f64;
+
+        assert_eq!(checksum, expected);
+    }
+
+    #[test]
+    fn generate_checksum_errors_on_unknown_signal_name() {
+        let msg = message(vec![signal(|s| s.name = "Data".to_string())]);
+        let result = generate_checksum(msg, HashMap::new(), "Nope".to_string());
+        assert!(result.is_err());
+    }
+}

@@ -19,3 +19,17 @@ lint:
 lint-fix:
     bunx biome check --write .
 
+test: test-frontend test-backend
+
+test-frontend:
+    bun run test
+
+test-backend:
+    cargo test --manifest-path src-tauri/Cargo.toml
+
+# Runs both suites with junit/html report generation, collected under test-results/.
+test-report: test-frontend
+    mkdir -p test-results/backend
+    cargo nextest run --manifest-path src-tauri/Cargo.toml
+    cp src-tauri/target/nextest/default/junit.xml test-results/backend/junit.xml
+

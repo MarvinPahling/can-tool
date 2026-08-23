@@ -113,3 +113,113 @@ pub fn parse_dbc_file(path: String) -> Result<DbcFile, String> {
     let dbc = Dbc::try_from(contents.as_str()).map_err(|e| e.to_string())?;
     Ok(dbc.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const SAMPLE_DBC: &str = r#"VERSION "1.0"
+
+NS_ :
+
+BS_:
+
+BU_: ECU1 ECU2
+
+BO_ 100 EngineData: 8 ECU1
+ SG_ RPM : 0|16@1+ (1,0) [0|65535] "rpm" ECU2
+ SG_ Temp : 16|8@1- (0.5,-40) [-40|215] "C" ECU2
+
+BO_ 200 ExtendedMsg: 4 ECU2
+ SG_ Flag m1 : 0|1@1+ (1,0) [0|1] "" ECU1
+"#;
+
+    #[test]
+    fn converts_numeric_value_variants_to_f64() {
+        assert_eq!(numeric_value_to_f64(NumericValue::Uint(7)), 7.0);
+        assert_eq!(numeric_value_to_f64(NumericValue::Int(-7)), -7.0);
+        assert_eq!(numeric_value_to_f64(NumericValue::Double(1.5)), 1.5);
+    }
+
+    #[test]
+    fn converts_each_multiplex_indicator_variant() {
+        assert!(matches!(
+            DbcMultiplexer::from(MultiplexIndicator::Plain),
+            DbcMultiplexer::Plain
+        ));
+        assert!(matches!(
+            DbcMultiplexer::from(MultiplexIndicator::Multiplexor),
+            DbcMultiplexer::Multiplexor
+        ));
+        assert!(matches!(
+            DbcMultiplexer::from(MultiplexIndicator::MultiplexedSignal(3)),
+            DbcMultiplexer::MultiplexedSignal { switch_value: 3 }
+        ));
+        assert!(matches!(
+            DbcMultiplexer::from(MultiplexIndicator::MultiplexorAndMultiplexedSignal(3)),
+            DbcMultiplexer::MultiplexorAndMultiplexedSignal { switch_value: 3 }
+        ));
+    }
+
+    #[test]
+    fn parses_a_valid_dbc_file_into_the_expected_shape() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(SAMPLE_DBC.as_bytes()).unwrap();
+
+        let dbc = parse_dbc_file(file.path().to_string_lossy().into_owned()).unwrap();
+
+        assert_eq!(dbc.version, "1.0");
+        assert_eq!(dbc.nodes, vec!["ECU1", "ECU2"]);
+        assert_eq!(dbc.messages.len(), 2);
+
+        let engine = dbc.messages.iter().find(|m| m.id == 100).unwrap();
+        assert_eq!(engine.name, "EngineData");
+        assert_eq!(engine.size, 8);
+        assert!(!engine.extended);
+        assert_eq!(engine.signals.len(), 2);
+
+        let rpm = engine.signals.iter().find(|s| s.name == "RPM").unwrap();
+        assert_eq!(rpm.start_bit, 0);
+        assert_eq!(rpm.size, 16);
+        assert!(rpm.little_endian);
+        assert!(!rpm.signed);
+        assert_eq!(rpm.factor, 1.0);
+        assert_eq!(rpm.unit, "rpm");
+
+        let temp = engine.signals.iter().find(|s| s.name == "Temp").unwrap();
+        assert!(temp.signed);
+        assert_eq!(temp.factor, 0.5);
+        assert_eq!(temp.offset, -40.0);
+    }
+
+    #[test]
+    fn parses_multiplexed_signals() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(SAMPLE_DBC.as_bytes()).unwrap();
+
+        let dbc = parse_dbc_file(file.path().to_string_lossy().into_owned()).unwrap();
+
+        let ext = dbc.messages.iter().find(|m| m.id == 200).unwrap();
+        let flag = ext.signals.iter().find(|s| s.name == "Flag").unwrap();
+        assert!(matches!(
+            flag.multiplexer,
+            DbcMultiplexer::MultiplexedSignal { switch_value: 1 }
+        ));
+    }
+
+    #[test]
+    fn errors_on_missing_file() {
+        let result = parse_dbc_file("/nonexistent/path/does-not-exist.dbc".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn errors_on_invalid_dbc_contents() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"this is not a valid dbc file").unwrap();
+
+        let result = parse_dbc_file(file.path().to_string_lossy().into_owned());
+        assert!(result.is_err());
+    }
+}
