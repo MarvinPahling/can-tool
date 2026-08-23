@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  commands:
+    frontend-lint:
+      glob: "*.{js,jsx,ts,tsx,json,css}"
+      exclude: "(src/routeTree\\.gen\\.ts|src/generated/.*)"
+      run: bunx biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+    rust-fmt:
+      glob: "src-tauri/**/*.rs"
+      run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      stage_fixed: true
+    rust-clippy:
+      glob: "src-tauri/**/*.rs"
+      run: cargo clippy --fix --allow-dirty --allow-staged --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      stage_fixed: true

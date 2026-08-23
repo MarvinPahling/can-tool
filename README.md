@@ -46,6 +46,12 @@ There's also `bun run dev` for the frontend alone (Vite only, no Tauri window, n
 
 There isn't any. There is no test runner configured. We are, as previously established, vibing. There is a linter — [Biome](https://biomejs.dev), configured in `biome.json` — so at least run `just lint` (and `tsc` / `cargo check` for type errors) before you commit something embarrassing.
 
+## Linting & pre-commit hooks
+
+Because vibing is not the same as having no standards, there's now a [Lefthook](https://github.com/evilmartians/lefthook) pre-commit hook (`lefthook.yml`) that runs Biome on staged frontend files and `cargo fmt` / `cargo clippy --fix` on staged Rust files, and auto-applies whatever it can before letting you commit. It's installed automatically via the `prepare` script when you `bun install`, so you get code quality whether you wanted it or not.
+
+Clippy runs with `-D warnings`, meaning it will actually block your commit over things it can't auto-fix — a wild concept for a codebase whose entire architecture was decided by vibes. If you get stopped, that's the hook working as intended, not a bug to `--no-verify` your way around.
+
 ## Contributing
 
 Read `AGENTS.md` first — it's the closest thing this repo has to documentation, and it's more thorough than most human-written READMEs anyway.

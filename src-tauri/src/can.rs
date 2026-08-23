@@ -45,7 +45,9 @@ pub fn list_can_devices() -> Result<Vec<CanDeviceInfo>, String> {
         .into_iter()
         .map(|port| {
             let (manufacturer, vid, pid) = match port.port_type {
-                SerialPortType::UsbPort(info) => (info.manufacturer, Some(info.vid), Some(info.pid)),
+                SerialPortType::UsbPort(info) => {
+                    (info.manufacturer, Some(info.vid), Some(info.pid))
+                }
                 _ => (None, None, None),
             };
             let is_canable = vid == Some(CANABLE_VID) && pid == Some(CANABLE_PID);
@@ -101,20 +103,23 @@ pub fn connect_can_device(
     write_slcan_command(&mut port, &format!("S{code}"))?;
     write_slcan_command(&mut port, "O")?;
 
-    let mut guard = state.0.lock().map_err(|_| "CAN state poisoned".to_string())?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
     *guard = Some(CanConnection {
         port,
-        status: CanConnectionStatus {
-            port_name,
-            bitrate,
-        },
+        status: CanConnectionStatus { port_name, bitrate },
     });
     Ok(())
 }
 
 #[tauri::command]
 pub fn disconnect_can_device(state: State<CanState>) -> Result<(), String> {
-    let mut guard = state.0.lock().map_err(|_| "CAN state poisoned".to_string())?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
     if let Some(mut connection) = guard.take() {
         let _ = write_slcan_command(&mut connection.port, "C");
     }
@@ -122,8 +127,13 @@ pub fn disconnect_can_device(state: State<CanState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn can_connection_status(state: State<CanState>) -> Result<Option<CanConnectionStatus>, String> {
-    let guard = state.0.lock().map_err(|_| "CAN state poisoned".to_string())?;
+pub fn can_connection_status(
+    state: State<CanState>,
+) -> Result<Option<CanConnectionStatus>, String> {
+    let guard = state
+        .0
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
     Ok(guard.as_ref().map(|c| c.status.clone()))
 }
 
@@ -161,8 +171,15 @@ fn signal_range(signal: &DbcSignal) -> (f64, f64) {
             max_raw as f64 * signal.factor + signal.offset,
         )
     } else {
-        let max_raw = if signal.size >= 64 { u64::MAX } else { (1u64 << signal.size) - 1 };
-        (signal.offset, max_raw as f64 * signal.factor + signal.offset)
+        let max_raw = if signal.size >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << signal.size) - 1
+        };
+        (
+            signal.offset,
+            max_raw as f64 * signal.factor + signal.offset,
+        )
     }
 }
 
@@ -203,7 +220,11 @@ pub fn encode_can_message(
             }
             (raw_i as u64) & ((1u64 << signal.size) - 1)
         } else {
-            let max_raw = if signal.size >= 64 { u64::MAX } else { (1u64 << signal.size) - 1 };
+            let max_raw = if signal.size >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << signal.size) - 1
+            };
             if raw < 0.0 || raw > max_raw as f64 {
                 return Err(format!(
                     "Signal '{}' encoded value {raw} does not fit in {} unsigned bits",
@@ -240,7 +261,11 @@ fn crc8_sae_j1850(data: &[u8]) -> u8 {
     for &byte in data {
         crc ^= byte;
         for _ in 0..8 {
-            crc = if crc & 0x80 != 0 { (crc << 1) ^ 0x1D } else { crc << 1 };
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x1D
+            } else {
+                crc << 1
+            };
         }
     }
     crc ^ 0xFF
@@ -271,7 +296,12 @@ pub fn generate_checksum(
     Ok((crc as f64) * signal.factor + signal.offset)
 }
 
-fn write_frame(port: &mut Box<dyn SerialPort>, id: u32, extended: bool, data: &[u8]) -> Result<(), String> {
+fn write_frame(
+    port: &mut Box<dyn SerialPort>,
+    id: u32,
+    extended: bool,
+    data: &[u8],
+) -> Result<(), String> {
     if data.len() > 8 {
         return Err("CAN frames support at most 8 data bytes".to_string());
     }
@@ -292,8 +322,16 @@ fn write_frame(port: &mut Box<dyn SerialPort>, id: u32, extended: bool, data: &[
 }
 
 #[tauri::command]
-pub fn send_can_frame(state: State<CanState>, id: u32, extended: bool, data: Vec<u8>) -> Result<(), String> {
-    let mut guard = state.0.lock().map_err(|_| "CAN state poisoned".to_string())?;
+pub fn send_can_frame(
+    state: State<CanState>,
+    id: u32,
+    extended: bool,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
     write_frame(&mut connection.port, id, extended, &data)
 }
@@ -305,7 +343,10 @@ pub fn send_can_message(
     values: HashMap<String, f64>,
 ) -> Result<(), String> {
     let data = encode_can_message(message.clone(), values)?;
-    let mut guard = state.0.lock().map_err(|_| "CAN state poisoned".to_string())?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
     write_frame(&mut connection.port, message.id, message.extended, &data)
 }
