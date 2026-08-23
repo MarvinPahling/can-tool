@@ -78,6 +78,14 @@ jobs:
             - **Linux**: `.deb`/`.rpm`/AppImage, take your pick, no we didn't test all of them equally.
             - **Windows**: the NSIS installer bundles its own WebView2 runtime, so it'll install without admin rights or an internet connection — a genuinely reasonable feature that took an embarrassing amount of yak-shaving to wire up.
 
+            macOS users: if Gatekeeper is giving your download the silent treatment, that's the quarantine flag, and this is a load-bearing paragraph buried deep enough in a release note that statistically almost none of you will ever see it, which honestly says more about release notes than it does about you:
+
+            ```bash
+            xattr -cr "/Applications/CAN Tool.app"
+            ```
+
+            Congratulations on being the rare soul who reads this far. Everyone else is currently googling "app is damaged and can't be opened" and about to have a much worse afternoon than you.
+
             No design doc was consulted in the making of this release.
           releaseDraft: true
           prerelease: false
