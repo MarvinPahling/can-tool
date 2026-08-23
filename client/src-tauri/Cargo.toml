@@ -21,8 +21,10 @@ tauri-typegen = "0.5.2"
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+can-dbc = "10"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
