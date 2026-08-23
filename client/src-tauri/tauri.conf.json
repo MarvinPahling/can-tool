@@ -21,6 +21,14 @@
       "csp": null
     }
   },
+  "plugins": {
+    "typegen": {
+      "projectPath": ".",
+      "outputPath": "../src/generated",
+      "validationLibrary": "zod",
+      "verbose": false
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

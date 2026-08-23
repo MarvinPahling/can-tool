@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# tauri-typegen cache (regenerated bindings in src/generated/ are committed)
+src/generated/.typecache
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
