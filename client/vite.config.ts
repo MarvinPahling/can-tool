@@ -1,12 +1,23 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { tanstackRouter } from "@tanstack/router-plugin/vite";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(() => ({
-  plugins: [react()],
+  plugins: [
+    // Must come before react() — generates routeTree.gen.ts and enables
+    // automatic per-route code splitting.
+    tanstackRouter({
+      target: "react",
+      autoCodeSplitting: true,
+      routesDirectory: "./src/routes",
+      generatedRouteTree: "./src/routeTree.gen.ts",
+    }),
+    react(),
+  ],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
