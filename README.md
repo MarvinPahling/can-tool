@@ -21,16 +21,14 @@ It mostly works. Load a `.dbc` file, browse messages and signals, stare at a ver
 ## Installation
 
 ```bash
-git clone <this-repo>
-cd can-tool/client
+git clone https://github.com/MarvinPahling/can-tool.git
+cd can-tool
 bun install
 ```
 
 That's it. That's the install. If it doesn't work, it's almost certainly a Tauri/Rust toolchain problem, not a `bun` problem — check the prerequisites link above before opening an issue about it.
 
 ## Running it
-
-All commands run from `client/`:
 
 ```bash
 just dev       # full Tauri app window, hot-reloaded (Rust backend + Vite frontend)

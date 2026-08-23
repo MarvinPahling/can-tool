@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A Tauri desktop app for interacting with a CAN FD bus. The app code lives entirely under `client/`; the repo root currently contains only `client/` and `docs/` (empty).
+A Tauri desktop app for interacting with a CAN FD bus.
 
-Frontend: React + TanStack Router + TanStack Query + Tailwind + shadcn/ui (base-ui style). Backend: Rust via Tauri 2. Package managers: bun (JS) and cargo (Rust). Task runner: `client/justfile`.
+Frontend: React + TanStack Router + TanStack Query + Tailwind + shadcn/ui (base-ui style). Backend: Rust via Tauri 2. Package managers: bun (JS) and cargo (Rust). Task runner: `justfile`.
 
 The starter scaffold's CRUD demo (posts) has been removed. The only domain feature so far is opening and parsing a DBC file (`src-tauri/src/dbc.rs`, driven by the `can-dbc` crate) and browsing it (message/signal table, per-message bit layout) — see "DBC feature" below. Expect this to grow into full CAN FD functionality (bus connections, frame streaming, live signal decoding, etc.) as the project develops.
 
 ## Commands
 
-All commands run from `client/` (the justfile assumes this cwd).
+All commands run from the repo root (the justfile assumes this cwd).
 
 ```
 just dev      # bun run tauri dev — full Tauri app window (Rust backend + Vite frontend, hot-reloaded)
@@ -22,8 +22,8 @@ just clean    # removes dist/, node_modules/.vite, and cargo-cleans src-tauri
 
 Other useful commands (no justfile target yet):
 - `bun run dev` / `bun run build` — Vite alone, frontend only (no Tauri window, no Rust backend).
-- `cargo check --manifest-path client/src-tauri/Cargo.toml` — typecheck Rust without a full build.
-- `cargo tauri-typegen generate` — regenerate `client/src/generated/{types,commands,index}.ts` from the Rust `#[tauri::command]` definitions. Re-run this after adding/changing a Tauri command; it also runs automatically at build time via `build.rs`.
+- `cargo check --manifest-path src-tauri/Cargo.toml` — typecheck Rust without a full build.
+- `cargo tauri-typegen generate` — regenerate `src/generated/{types,commands,index}.ts` from the Rust `#[tauri::command]` definitions. Re-run this after adding/changing a Tauri command; it also runs automatically at build time via `build.rs`.
 
 There is no test runner or linter configured yet in `package.json`/Cargo.toml.
 
@@ -31,13 +31,13 @@ There is no test runner or linter configured yet in `package.json`/Cargo.toml.
 
 ### End-to-end type safety via tauri-typegen
 
-Rust `#[tauri::command]` functions in `src-tauri/src/*.rs` are the single source of truth for backend API shape. `tauri-typegen` (invoked from `build.rs` at build time, or manually via `cargo tauri-typegen generate`) generates Zod-validated TypeScript bindings into `client/src/generated/` (`types.ts`, `commands.ts`, `index.ts`). **Never hand-edit files in `src/generated/`** — they're regenerated and marked as such.
+Rust `#[tauri::command]` functions in `src-tauri/src/*.rs` are the single source of truth for backend API shape. `tauri-typegen` (invoked from `build.rs` at build time, or manually via `cargo tauri-typegen generate`) generates Zod-validated TypeScript bindings into `src/generated/` (`types.ts`, `commands.ts`, `index.ts`). **Never hand-edit files in `src/generated/`** — they're regenerated and marked as such.
 
 The flow for adding a new backend operation:
 1. Add a `#[tauri::command]` fn (and any `Serialize`/`Deserialize` structs) in `src-tauri/src/<module>.rs`, register it in the `invoke_handler![...]` list in `lib.rs`.
 2. Regenerate bindings (`cargo tauri-typegen generate`, or just build).
-3. Wrap the generated command in `client/src/api/<domain>.ts` — this is the hand-written boundary layer that re-exports/narrows generated types and adapts call signatures (e.g. `fetchPost(id)` instead of `fetchPostCommand({ id })`).
-4. Consume the api module from `client/src/queries/<domain>.ts`.
+3. Wrap the generated command in `src/api/<domain>.ts` — this is the hand-written boundary layer that re-exports/narrows generated types and adapts call signatures (e.g. `fetchPost(id)` instead of `fetchPostCommand({ id })`).
+4. Consume the api module from `src/queries/<domain>.ts`.
 
 ### Data layer: TanStack Query conventions
 
@@ -48,11 +48,11 @@ Each domain has a `queries/<domain>.ts` module built on:
 
 ### Routing
 
-TanStack Router with file-based routes under `client/src/routes/`, code-generated into `routeTree.gen.ts` (do not hand-edit). Route loaders call `queryClient.ensureQueryData(...)` using the shared query-options factories so navigation and preloading populate the Query cache before render; components then read via `useSuspenseQuery`. Search-param state (filters, pagination) is validated with `zod` schemas in `validateSearch` and kept in the URL rather than component state. The router is configured in `client/src/router.tsx` (`defaultPreload: "intent"`, shared pending/error components).
+TanStack Router with file-based routes under `src/routes/`, code-generated into `routeTree.gen.ts` (do not hand-edit). Route loaders call `queryClient.ensureQueryData(...)` using the shared query-options factories so navigation and preloading populate the Query cache before render; components then read via `useSuspenseQuery`. Search-param state (filters, pagination) is validated with `zod` schemas in `validateSearch` and kept in the URL rather than component state. The router is configured in `src/router.tsx` (`defaultPreload: "intent"`, shared pending/error components).
 
 ### UI components
 
-shadcn/ui components (base-ui style, "mist" base color) live in `client/src/components/ui/` (currently: `button`, `card`, `alert`, `badge`, `input`, `select`, `dialog`, `dropdown-menu`, `table`), configured via `client/components.json`. Follow shadcn conventions when adding new primitives (`bunx shadcn add <component>`). General principle: build the frontend from small reusable components rather than large page-specific ones.
+shadcn/ui components (base-ui style, "mist" base color) live in `src/components/ui/` (currently: `button`, `card`, `alert`, `badge`, `input`, `select`, `dialog`, `dropdown-menu`, `table`), configured via `components.json`. Follow shadcn conventions when adding new primitives (`bunx shadcn add <component>`). General principle: build the frontend from small reusable components rather than large page-specific ones.
 
 Custom-chrome window: the OS titlebar is disabled (see `tauri.conf.json`) and replaced by `src/components/titlebar.tsx`, which drags via `data-tauri-drag-region` and drives `@tauri-apps/api/window`'s `getCurrentWindow()` for minimize/maximize/close, plus hosts `ThemeToggle` and the shortcuts-dialog trigger. `src/routes/__root.tsx` renders `Titlebar` above the routed content.
 
