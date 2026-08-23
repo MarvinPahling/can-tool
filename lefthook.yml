@@ -21,3 +21,8 @@ pre-commit:
     rust-test:
       glob: "src-tauri/**/*.rs"
       run: cargo test --manifest-path src-tauri/Cargo.toml
+
+pre-push:
+  commands:
+    check-tag-version:
+      run: ./scripts/check-tag-version.sh

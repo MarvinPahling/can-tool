@@ -26,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: sync app version to tag
+        run: node scripts/sync-version.mjs "${{ github.ref_name }}"
+
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
