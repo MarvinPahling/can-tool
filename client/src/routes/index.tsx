@@ -1,3 +1,5 @@
+import { useRef } from "react";
+import type { ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { z } from "zod";
@@ -7,6 +9,7 @@ import { DbcSummary } from "@/components/dbc-summary";
 import { DbcTable } from "@/components/dbc-table";
 import { useParseDbcFile } from "@/queries/dbc";
 import { cn } from "@/lib/utils";
+import { formatBinding, useCommandHandler, useEffectiveBinding, useScope } from "@/commands";
 
 const searchSchema = z.object({
   q: z.string().optional(),
@@ -21,6 +24,8 @@ function HomeComponent() {
   const parseDbcFile = useParseDbcFile();
   const { q = "" } = Route.useSearch();
   const navigate = Route.useNavigate();
+  const filterInputRef = useRef<HTMLInputElement>(null);
+  const openBinding = useEffectiveBinding("file.open");
 
   async function handleOpenDbcFile() {
     const path = await open({
@@ -32,6 +37,14 @@ function HomeComponent() {
     }
   }
 
+  // "file.open" is bound to Mod+O by default and to the native File > Open File…
+  // menu item (src-tauri/src/lib.rs); both trigger this same implementation.
+  useCommandHandler("file.open", handleOpenDbcFile);
+
+  // "table.focusFilter" ("G" then "F") is scoped to "dbc-table" (see
+  // DbcTableScope below), so the sequence only fires while a file is loaded.
+  useCommandHandler("table.focusFilter", () => filterInputRef.current?.focus());
+
   return (
     <div className={cn("mx-auto p-8", parseDbcFile.isSuccess ? "max-w-4xl" : "max-w-xl")}>
       <h1 className="text-xl font-semibold">CAN Tool</h1>
@@ -40,6 +53,7 @@ function HomeComponent() {
         <Button onClick={handleOpenDbcFile} disabled={parseDbcFile.isPending}>
           {parseDbcFile.isPending ? "Parsing…" : "Open DBC file"}
         </Button>
+        <span className="ml-2 text-xs text-muted-foreground">{formatBinding(openBinding)}</span>
 
         {parseDbcFile.isError && (
           <Alert variant="destructive" className="mt-3">
@@ -55,19 +69,28 @@ function HomeComponent() {
         {parseDbcFile.isSuccess && (
           <div className="mt-3 space-y-4">
             <DbcSummary dbc={parseDbcFile.data} />
-            <DbcTable
-              dbc={parseDbcFile.data}
-              globalFilter={q}
-              onGlobalFilterChange={(value) =>
-                navigate({
-                  search: (prev) => ({ ...prev, q: value || undefined }),
-                  replace: true,
-                })
-              }
-            />
+            <DbcTableScope>
+              <DbcTable
+                dbc={parseDbcFile.data}
+                globalFilter={q}
+                onGlobalFilterChange={(value) =>
+                  navigate({
+                    search: (prev) => ({ ...prev, q: value || undefined }),
+                    replace: true,
+                  })
+                }
+                filterInputRef={filterInputRef}
+              />
+            </DbcTableScope>
           </div>
         )}
       </div>
     </div>
   );
+}
+
+/** Activates the "dbc-table" command scope only while the table is mounted. */
+function DbcTableScope({ children }: { children: ReactNode }) {
+  useScope("dbc-table");
+  return <>{children}</>;
 }

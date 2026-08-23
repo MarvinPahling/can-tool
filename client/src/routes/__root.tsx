@@ -3,6 +3,8 @@ import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import type { QueryClient } from "@tanstack/react-query";
 
 import { Titlebar } from "@/components/titlebar";
+import { ShortcutsDialog } from "@/components/shortcuts-dialog";
+import { CommandsProvider } from "@/commands";
 
 interface RouterContext {
   queryClient: QueryClient;
@@ -23,12 +25,15 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 
 function RootComponent() {
   return (
-    <div className="flex h-screen flex-col">
-      <Titlebar />
-      <div className="flex-1 overflow-auto">
-        <Outlet />
+    <CommandsProvider>
+      <div className="flex h-screen flex-col">
+        <Titlebar />
+        <div className="flex-1 overflow-auto">
+          <Outlet />
+        </div>
+        <TanStackRouterDevtools position="bottom-right" />
       </div>
-      <TanStackRouterDevtools position="bottom-right" />
-    </div>
+      <ShortcutsDialog />
+    </CommandsProvider>
   );
 }

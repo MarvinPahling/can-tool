@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Square, Copy, X } from "lucide-react";
+import { Minus, Square, Copy, X, Keyboard } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { runCommand } from "@/commands";
 
 const appWindow = getCurrentWindow();
 
@@ -28,6 +29,15 @@ export function Titlebar() {
         <span className="text-xs font-medium text-sidebar-foreground">client</span>
       </div>
       <div className="flex h-full items-center">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-full w-10 rounded-none"
+          title="Keyboard Shortcuts…"
+          onClick={() => runCommand("app.showShortcuts")}
+        >
+          <Keyboard />
+        </Button>
         <Button
           variant="ghost"
           size="icon"

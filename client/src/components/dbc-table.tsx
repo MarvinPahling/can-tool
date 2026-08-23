@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { ChevronRight } from "lucide-react";
 import { useTable } from "@tanstack/react-table";
 import type { DbcFile } from "@/api/dbc";
@@ -20,11 +21,14 @@ export function DbcTable({
   dbc,
   globalFilter,
   onGlobalFilterChange,
+  filterInputRef,
 }: {
   dbc: DbcFile;
   /** Owned by the route (synced to the URL `q` search param), not by the table. */
   globalFilter: string;
   onGlobalFilterChange: (value: string) => void;
+  /** Exposed so the route can focus it for the "table.focusFilter" command ("G F"). */
+  filterInputRef?: Ref<HTMLInputElement>;
 }) {
   const data = buildDbcRows(dbc);
 
@@ -47,6 +51,7 @@ export function DbcTable({
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
         <Input
+          ref={filterInputRef}
           placeholder="Filter messages and signals…"
           value={globalFilter}
           onChange={(e) => table.setGlobalFilter(e.target.value)}
