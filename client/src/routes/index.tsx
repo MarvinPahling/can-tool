@@ -1,6 +1,8 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { DbcSummary } from "@/components/dbc-summary";
 import { useParseDbcFile } from "@/queries/dbc";
 
 export const Route = createFileRoute("/")({
@@ -21,38 +23,29 @@ function HomeComponent() {
   }
 
   return (
-    <div className="page">
-      <h1>Welcome</h1>
-      <p>
-        This app is wired up with TanStack Router: a generated route tree,
-        typed params and search schemas, loaders, intent preloading, and
-        automatic per-route code splitting.
-      </p>
-      <p>
-        Head to <Link to="/posts">Posts</Link> and try filtering — the filter
-        and page live in the URL, so the view is fully shareable and
-        back-button friendly.
-      </p>
+    <div className="mx-auto max-w-xl p-8">
+      <h1 className="text-xl font-semibold">CAN Tool</h1>
 
-      <div style={{ marginTop: "1.5rem" }}>
+      <div className="mt-6">
         <Button onClick={handleOpenDbcFile} disabled={parseDbcFile.isPending}>
           {parseDbcFile.isPending ? "Parsing…" : "Open DBC file"}
         </Button>
 
         {parseDbcFile.isError && (
-          <p style={{ color: "var(--destructive, crimson)" }}>
-            {parseDbcFile.error instanceof Error
-              ? parseDbcFile.error.message
-              : "Failed to parse DBC file"}
-          </p>
+          <Alert variant="destructive" className="mt-3">
+            <AlertTitle>Failed to parse DBC file</AlertTitle>
+            <AlertDescription>
+              {parseDbcFile.error instanceof Error
+                ? parseDbcFile.error.message
+                : "Unknown error"}
+            </AlertDescription>
+          </Alert>
         )}
 
         {parseDbcFile.isSuccess && (
-          <p>
-            Parsed DBC version "{parseDbcFile.data.version}" with{" "}
-            {parseDbcFile.data.nodes.length} node(s) and{" "}
-            {parseDbcFile.data.messages.length} message(s).
-          </p>
+          <div className="mt-3">
+            <DbcSummary dbc={parseDbcFile.data} />
+          </div>
         )}
       </div>
     </div>

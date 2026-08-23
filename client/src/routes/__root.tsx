@@ -1,9 +1,4 @@
-import {
-  createRootRouteWithContext,
-  Link,
-  Outlet,
-  useRouterState,
-} from "@tanstack/react-router";
+import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router";
 import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import type { QueryClient } from "@tanstack/react-query";
 
@@ -14,31 +9,19 @@ interface RouterContext {
 export const Route = createRootRouteWithContext<RouterContext>()({
   component: RootComponent,
   notFoundComponent: () => (
-    <div className="page">
-      <h1>404</h1>
-      <p>That page doesn't exist.</p>
-      <Link to="/">Go home</Link>
+    <div className="mx-auto max-w-xl p-8">
+      <h1 className="text-xl font-semibold">404</h1>
+      <p className="mt-3 text-muted-foreground">That page doesn't exist.</p>
+      <Link to="/" className="text-primary underline-offset-4 hover:underline">
+        Go home
+      </Link>
     </div>
   ),
 });
 
 function RootComponent() {
-  const isLoading = useRouterState({ select: (s) => s.status === "pending" });
-
   return (
     <>
-      <nav className="nav">
-        <Link to="/" activeOptions={{ exact: true }} activeProps={{ className: "active" }}>
-          Home
-        </Link>
-        <Link to="/posts" activeProps={{ className: "active" }}>
-          Posts
-        </Link>
-        <Link to="/about" activeProps={{ className: "active" }}>
-          About
-        </Link>
-        {isLoading && <span className="nav-spinner" aria-label="Loading">⋯</span>}
-      </nav>
       <Outlet />
       <TanStackRouterDevtools position="bottom-right" />
     </>

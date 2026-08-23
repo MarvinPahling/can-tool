@@ -8,7 +8,7 @@ A Tauri desktop app for interacting with a CAN FD bus. The app code lives entire
 
 Frontend: React + TanStack Router + TanStack Query + Tailwind + shadcn/ui (base-ui style). Backend: Rust via Tauri 2. Package managers: bun (JS) and cargo (Rust). Task runner: `client/justfile`.
 
-The current source tree (`posts.rs`, `queries/posts.ts`, `routes/posts/*`) is the starter scaffold's CRUD demo, not domain code — expect it to be replaced by CAN FD functionality (bus connections, frame streaming, DBC/signal decoding, etc.) as the project develops.
+The starter scaffold's CRUD demo (posts) has been removed. The only domain feature so far is opening and parsing a DBC file (`src-tauri/src/dbc.rs`, driven by the `can-dbc` crate) — see "DBC feature" below. Expect this to grow into full CAN FD functionality (bus connections, frame streaming, live signal decoding, etc.) as the project develops.
 
 ## Commands
 
@@ -56,4 +56,21 @@ shadcn/ui components (base-ui style, "mist" base color) live in `client/src/comp
 
 ### Tauri backend structure
 
-`src-tauri/src/lib.rs` wires plugins, app state (`.manage(...)`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (e.g. `posts.rs`) each exposing `#[tauri::command]` functions and any managed state structs.
+`src-tauri/src/lib.rs` wires plugins and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (e.g. `dbc.rs`) each exposing `#[tauri::command]` functions and any managed state structs.
+
+## DBC feature
+
+The only implemented domain feature: pick a `.dbc` file from disk and parse it into a typed message/signal tree, entirely client-side (no persisted state, no backend store).
+
+**Backend (`src-tauri/src/dbc.rs`)**
+- Wraps the `can-dbc` crate. `parse_dbc_file(path: String) -> Result<DbcFile, String>` reads the file, parses it with `Dbc::try_from`, and converts it via `From<Dbc> for DbcFile` into serde-serializable types — `DbcFile { version, nodes, messages }`, `DbcMessage { id, extended, name, size, transmitter, signals }`, `DbcSignal { name, start_bit, size, little_endian, signed, factor, offset, min, max, unit, receivers, multiplexer }`, and the `DbcMultiplexer` enum (`Plain` / `Multiplexor` / `MultiplexedSignal { switch_value }` / `MultiplexorAndMultiplexedSignal { switch_value }`, serialized with a `kind` tag). Errors (bad path, parse failure) are mapped to `String` and surface as a rejected promise on the frontend.
+- Registered as the sole command in `invoke_handler![...]` in `lib.rs`.
+
+**Frontend, following the standard layering (see "End-to-end type safety" and "Data layer" above):**
+- `src/generated/{types,commands}.ts` — auto-generated Zod schemas/types (`DbcFile`, `DbcMessage`, `DbcSignal`, `DbcMultiplexer`) and the `parseDbcFile` invoke wrapper. Do not hand-edit.
+- `src/api/dbc.ts` — hand-written boundary: re-exports the `DbcFile` type and narrows `parseDbcFileCommand({ path })` to `parseDbcFile(path: string)`.
+- `src/queries/dbc.ts` — `useParseDbcFile()`, a plain `useMutation` wrapping `parseDbcFile` (no query-key factory needed; this is a one-shot file-picker action, not cached list/detail data like the old posts domain).
+- `src/routes/index.tsx` — the only route. Uses `@tauri-apps/plugin-dialog`'s `open()` to let the user pick a `.dbc` file, then calls `parseDbcFile.mutate(path)`. Renders the shadcn `Button` (pending state while parsing), a destructive `Alert`/`AlertTitle`/`AlertDescription` on error, and `DbcSummary` on success.
+- `src/components/dbc-summary.tsx` — reusable presentational component; takes a parsed `DbcFile` and renders it in a shadcn `Card` (version in `CardTitle`, node/message counts in `CardContent`). Kept separate from the route so it can be reused wherever a `DbcFile` needs to be displayed (e.g. a future message/signal browser).
+
+To extend this (e.g. list signals per message, decode live frames), keep the same shape: extend `DbcFile`/related structs in `dbc.rs`, regenerate bindings, then add focused presentational components under `src/components/` (following the shadcn-primitives-first, reusable-components guidance above) rather than growing `index.tsx` or `DbcSummary` directly.

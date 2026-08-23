@@ -3,13 +3,13 @@ import { routeTree } from "./routeTree.gen";
 import { queryClient } from "./lib/query-client";
 
 function DefaultPending() {
-  return <div className="page muted">Loading…</div>;
+  return <div className="mx-auto max-w-xl p-8 text-muted-foreground">Loading…</div>;
 }
 
 function DefaultError({ error }: { error: Error }) {
   return (
-    <div className="page">
-      <p className="error">Something went wrong: {error.message}</p>
+    <div className="mx-auto max-w-xl p-8">
+      <p className="text-destructive">Something went wrong: {error.message}</p>
     </div>
   );
 }
