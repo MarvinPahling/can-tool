@@ -37,7 +37,7 @@ If you grabbed a `.dmg` from the [releases page](https://github.com/MarvinPahlin
 The fix, since Apple removed the polite GUI way of doing this:
 
 ```bash
-xattr -cr "/Applications/can-tool.app"
+xattr -cr "/Applications/CAN Tool.app"
 ```
 
 This strips the quarantine flag Gatekeeper slapped on it during download, and the app will open like nothing ever happened. Is this "training yourself to run arbitrary unsigned binaries from the internet by disabling a security feature"? Yes. Are we going to fix it by paying Apple $99/year for a Developer ID and wiring up notarization in CI? Also yes, eventually, probably, once the vibes align.
