@@ -1,0 +1,126 @@
+import { ChevronRight } from "lucide-react";
+import { useTable } from "@tanstack/react-table";
+import type { DbcFile } from "@/api/dbc";
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Input } from "@/components/ui/input";
+import { dbcTableFeatures } from "@/lib/dbc-table/features";
+import { dbcColumns } from "@/lib/dbc-table/columns";
+import { buildDbcRows, getDbcSubRows, type DbcRow } from "@/lib/dbc-table/rows";
+import { cn } from "@/lib/utils";
+
+export function DbcTable({
+  dbc,
+  globalFilter,
+  onGlobalFilterChange,
+}: {
+  dbc: DbcFile;
+  /** Owned by the route (synced to the URL `q` search param), not by the table. */
+  globalFilter: string;
+  onGlobalFilterChange: (value: string) => void;
+}) {
+  const data = buildDbcRows(dbc);
+
+  const table = useTable({
+    features: dbcTableFeatures,
+    columns: dbcColumns,
+    data,
+    getSubRows: getDbcSubRows,
+    getRowId: (row: DbcRow) => row.id,
+    state: { globalFilter },
+    onGlobalFilterChange: (updater) =>
+      onGlobalFilterChange(
+        typeof updater === "function" ? updater(globalFilter) : updater,
+      ),
+    globalFilterFn: "includesString",
+    initialState: { expanded: true },
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <Input
+          placeholder="Filter messages and signals…"
+          value={globalFilter}
+          onChange={(e) => table.setGlobalFilter(e.target.value)}
+          className="max-w-xs"
+        />
+        <table.Subscribe selector={(state) => state.globalFilter}>
+          {() => (
+            <span className="text-xs text-muted-foreground">
+              {table.getRowModel().rows.length} message(s)
+            </span>
+          )}
+        </table.Subscribe>
+      </div>
+
+      <Table>
+        <TableCaption className="sr-only">
+          DBC messages and signals from "{dbc.version}"
+        </TableCaption>
+        <TableHeader>
+          {table.getHeaderGroups().map((headerGroup) => (
+            <TableRow key={headerGroup.id}>
+              {headerGroup.headers.map((header) => (
+                <TableHead
+                  key={header.id}
+                  className={header.column.id === "expander" ? "w-8" : undefined}
+                >
+                  {header.isPlaceholder ? null : header.column.getCanSort() ? (
+                    <button
+                      type="button"
+                      onClick={header.column.getToggleSortingHandler()}
+                      className="flex items-center gap-1 hover:text-foreground"
+                    >
+                      <table.FlexRender header={header} />
+                      {{ asc: "↑", desc: "↓" }[header.column.getIsSorted() as string] ?? null}
+                    </button>
+                  ) : (
+                    <table.FlexRender header={header} />
+                  )}
+                </TableHead>
+              ))}
+            </TableRow>
+          ))}
+        </TableHeader>
+        <TableBody>
+          {table.getRowModel().rows.map((row) => (
+            <TableRow key={row.id} className={cn(row.original.kind === "signal" && "bg-muted/20")}>
+              {row.getAllCells().map((cell) => (
+                <TableCell key={cell.id}>
+                  {cell.column.id === "expander" ? (
+                    row.getCanExpand() ? (
+                      <button
+                        type="button"
+                        onClick={row.getToggleExpandedHandler()}
+                        aria-expanded={row.getIsExpanded()}
+                        aria-label={row.getIsExpanded() ? "Collapse row" : "Expand row"}
+                        className="text-muted-foreground hover:text-foreground"
+                      >
+                        <ChevronRight
+                          className={cn(
+                            "size-3.5 transition-transform",
+                            row.getIsExpanded() && "rotate-90",
+                          )}
+                        />
+                      </button>
+                    ) : null
+                  ) : (
+                    <table.FlexRender cell={cell} />
+                  )}
+                </TableCell>
+              ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
