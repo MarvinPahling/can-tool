@@ -2,6 +2,8 @@ import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router
 import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import type { QueryClient } from "@tanstack/react-query";
 
+import { Titlebar } from "@/components/titlebar";
+
 interface RouterContext {
   queryClient: QueryClient;
 }
@@ -21,9 +23,12 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 
 function RootComponent() {
   return (
-    <>
-      <Outlet />
+    <div className="flex h-screen flex-col">
+      <Titlebar />
+      <div className="flex-1 overflow-auto">
+        <Outlet />
+      </div>
       <TanStackRouterDevtools position="bottom-right" />
-    </>
+    </div>
   );
 }
