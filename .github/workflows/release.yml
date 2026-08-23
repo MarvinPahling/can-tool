@@ -20,7 +20,7 @@ jobs:
           - platform: ubuntu-22.04
             args: ""
           - platform: windows-latest
-            args: ""
+            args: "--bundles nsis"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -43,13 +43,25 @@ jobs:
       - name: install frontend dependencies
         run: bun install
 
+      - name: stage WebView2 fixed version runtime (windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/fetch-webview2-runtime.ps1
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "CAN Tool ${{ github.ref_name }}"
-          releaseBody: "See the assets to download and install this version."
+          releaseBody: |
+            Another version, vibed into existence. Grab the asset for your OS below and pretend you read a changelog.
+
+            - **macOS**: `.dmg`, both Apple Silicon and Intel, because someone still has a 2015 MacBook.
+            - **Linux**: `.deb`/`.rpm`/AppImage, take your pick, no we didn't test all of them equally.
+            - **Windows**: the NSIS installer bundles its own WebView2 runtime, so it'll install without admin rights or an internet connection — a genuinely reasonable feature that took an embarrassing amount of yak-shaving to wire up.
+
+            No design doc was consulted in the making of this release.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

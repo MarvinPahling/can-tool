@@ -6,6 +6,13 @@ dev:
 build:
     bun run tauri build
 
+# Windows-only: stage the WebView2 fixed version runtime, then build an
+# enterprise-ready NSIS installer that needs no admin rights and no internet
+# access on the target machine.
+build-windows-enterprise:
+    pwsh -File ./scripts/fetch-webview2-runtime.ps1
+    bun run tauri build --bundles nsis
+
 clean:
     rm -rf dist node_modules/.vite
     cargo clean --manifest-path src-tauri/Cargo.toml

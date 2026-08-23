@@ -19,6 +19,10 @@ allure-results
 # tauri-typegen cache (regenerated bindings in src/generated/ are committed)
 src/generated/.typecache
 
+# Downloaded WebView2 fixed version runtime, staged for the enterprise NSIS
+# bundle by scripts/fetch-webview2-runtime.ps1
+src-tauri/WebView2Runtime
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
