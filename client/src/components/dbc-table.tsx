@@ -15,7 +15,11 @@ import { Input } from "@/components/ui/input";
 import { dbcTableFeatures } from "@/lib/dbc-table/features";
 import { dbcColumns } from "@/lib/dbc-table/columns";
 import { buildDbcRows, getDbcSubRows, type DbcRow } from "@/lib/dbc-table/rows";
+import { useRequestSendMessage } from "@/lib/pending-send";
 import { cn } from "@/lib/utils";
+
+const modKeyLabel =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform) ? "⌘" : "Ctrl";
 
 export function DbcTable({
   dbc,
@@ -36,6 +40,7 @@ export function DbcTable({
   onSignalHover?: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
   const data = buildDbcRows(dbc);
+  const requestSendMessage = useRequestSendMessage();
 
   const table = useTable({
     features: dbcTableFeatures,
@@ -104,6 +109,7 @@ export function DbcTable({
           {table.getRowModel().rows.map((row) => (
             <TableRow
               key={row.id}
+              title={`${modKeyLabel}-click to send this message`}
               className={cn(
                 row.original.kind === "signal" && "bg-muted/20",
                 row.original.kind === "signal" &&
@@ -117,6 +123,11 @@ export function DbcTable({
               onMouseLeave={() =>
                 row.original.kind === "signal" && onSignalHover?.(null)
               }
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey) {
+                  requestSendMessage(String(row.original.message.id));
+                }
+              }}
             >
               {row.getAllCells().map((cell) => (
                 <TableCell key={cell.id}>

@@ -154,7 +154,11 @@ function SignalLayoutSection({
         }}
       >
         <SelectTrigger className="w-64">
-          <SelectValue placeholder="Select a message" />
+          <SelectValue placeholder="Select a message">
+            {(value: string | null) =>
+              messages.find((message) => String(message.id) === value)?.name ?? "Select a message"
+            }
+          </SelectValue>
         </SelectTrigger>
         <SelectContent>
           {messages.map((message) => (

@@ -1,16 +1,19 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Square, Copy, X, Keyboard } from "lucide-react";
+import { Minus, Square, Copy, X, Keyboard, Usb, Send } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { runCommand, useCommandHandler } from "@/commands";
 import { cycleTheme } from "@/lib/theme";
+import { useConnectionStatus } from "@/queries/can";
+import { cn } from "@/lib/utils";
 
 const appWindow = getCurrentWindow();
 
 export function Titlebar() {
   const [isMaximized, setIsMaximized] = useState(false);
+  const status = useConnectionStatus();
 
   useCommandHandler("app.toggleTheme", cycleTheme);
 
@@ -34,6 +37,30 @@ export function Titlebar() {
       </div>
       <div className="flex h-full items-center">
         <ThemeToggle />
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-full w-10 rounded-none"
+          title="Send CAN Message…"
+          onClick={() => runCommand("message.send")}
+        >
+          <Send />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="relative h-full w-10 rounded-none"
+          title={status.data ? `Connected to ${status.data.port_name}` : "Connect Device…"}
+          onClick={() => runCommand("device.connect")}
+        >
+          <Usb />
+          <span
+            className={cn(
+              "absolute right-2.5 top-2 size-1.5 rounded-full",
+              status.data ? "bg-emerald-500" : "bg-muted-foreground/40",
+            )}
+          />
+        </Button>
         <Button
           variant="ghost"
           size="icon"

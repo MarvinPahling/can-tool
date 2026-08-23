@@ -1,8 +1,13 @@
+import type { MouseEvent } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { DbcMessage, DbcSignal } from "@/api/dbc";
 import { buildSignalBitMap } from "@/lib/signal-bits";
 import { getSignalColor } from "@/lib/signal-colors";
+import { useRequestSendMessage } from "@/lib/pending-send";
 import { cn } from "@/lib/utils";
+
+const modKeyLabel =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform) ? "⌘" : "Ctrl";
 
 export function SignalBitGrid({
   message,
@@ -15,6 +20,7 @@ export function SignalBitGrid({
 }) {
   const bitMap = buildSignalBitMap(message.signals);
   const bitCount = message.size * 8;
+  const requestSendMessage = useRequestSendMessage();
 
   return (
     <Card>
@@ -37,9 +43,16 @@ export function SignalBitGrid({
                     color={ownerIndex >= 0 ? getSignalColor(ownerIndex) : undefined}
                     dimmed={hoveredSignal != null && !isHovered}
                     isHovered={isHovered}
-                    title={owner ? `${owner.name} — bit ${index}` : `bit ${index}`}
+                    title={
+                      owner
+                        ? `${owner.name} — bit ${index} (${modKeyLabel}-click to send this message)`
+                        : `bit ${index}`
+                    }
                     onMouseEnter={() => owner && onSignalHover?.(owner)}
                     onMouseLeave={() => owner && onSignalHover?.(null)}
+                    onClick={(e) => {
+                      if (e.metaKey || e.ctrlKey) requestSendMessage(String(message.id));
+                    }}
                   />
                 );
               })}
@@ -90,6 +103,7 @@ function BitBox({
   title,
   onMouseEnter,
   onMouseLeave,
+  onClick,
 }: {
   index: number;
   color?: string;
@@ -98,12 +112,14 @@ function BitBox({
   title: string;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  onClick?: (e: MouseEvent) => void;
 }) {
   return (
     <div
       title={title}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
+      onClick={onClick}
       className={cn(
         "flex size-6 items-center justify-center rounded-sm text-[10px] font-medium tabular-nums",
         color ? "text-primary-foreground" : "bg-muted text-muted-foreground",

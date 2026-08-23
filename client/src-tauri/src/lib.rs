@@ -1,5 +1,10 @@
+mod can;
 mod dbc;
 
+use can::{
+    can_connection_status, connect_can_device, disconnect_can_device, encode_can_message,
+    generate_checksum, list_can_devices, send_can_frame, send_can_message, CanState,
+};
 use dbc::parse_dbc_file;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
@@ -16,7 +21,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![parse_dbc_file])
+        .manage(CanState::default())
+        .invoke_handler(tauri::generate_handler![
+            parse_dbc_file,
+            list_can_devices,
+            connect_can_device,
+            disconnect_can_device,
+            can_connection_status,
+            encode_can_message,
+            generate_checksum,
+            send_can_frame,
+            send_can_message,
+        ])
         .menu(|handle| {
             // On macOS the *first* top-level submenu is always coerced into the
             // bold application menu (named after the app, holding About/Quit/etc)

@@ -4,6 +4,8 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import { Titlebar } from "@/components/titlebar";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
+import { DeviceConnectDialog } from "@/components/device-connect-dialog";
+import { SendMessageDialog } from "@/components/send-message-dialog";
 import { CommandsProvider } from "@/commands";
 
 interface RouterContext {
@@ -34,6 +36,8 @@ function RootComponent() {
         <TanStackRouterDevtools position="bottom-right" />
       </div>
       <ShortcutsDialog />
+      <DeviceConnectDialog />
+      <SendMessageDialog />
     </CommandsProvider>
   );
 }

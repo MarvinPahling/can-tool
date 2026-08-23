@@ -1,14 +1,14 @@
 use can_dbc::{Dbc, MultiplexIndicator, NumericValue};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DbcFile {
     pub version: String,
     pub nodes: Vec<String>,
     pub messages: Vec<DbcMessage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DbcMessage {
     pub id: u32,
     pub extended: bool,
@@ -18,7 +18,7 @@ pub struct DbcMessage {
     pub signals: Vec<DbcSignal>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DbcSignal {
     pub name: String,
     pub start_bit: u64,
@@ -34,7 +34,7 @@ pub struct DbcSignal {
     pub multiplexer: DbcMultiplexer,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind")]
 pub enum DbcMultiplexer {
     Plain,
