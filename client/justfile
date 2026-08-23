@@ -1,0 +1,11 @@
+default: dev
+
+dev:
+    bun run tauri dev
+
+build:
+    bun run tauri build
+
+clean:
+    rm -rf dist node_modules/.vite
+    cargo clean --manifest-path src-tauri/Cargo.toml
