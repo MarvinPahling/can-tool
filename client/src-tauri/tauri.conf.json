@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "client",
+  "productName": "CAN Tool",
   "version": "0.1.0",
   "identifier": "de.marvin.client",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "client",
+        "title": "CAN Tool",
         "width": 800,
         "height": 600,
         "maximized": true,

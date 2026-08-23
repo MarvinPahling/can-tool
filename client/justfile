@@ -9,3 +9,7 @@ build:
 clean:
     rm -rf dist node_modules/.vite
     cargo clean --manifest-path src-tauri/Cargo.toml
+
+gen-icon:
+    cd ./src-tauri/ && bunx tauri icon --output ./icons/ ./icons/net.svg
+

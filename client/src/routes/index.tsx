@@ -1,13 +1,22 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { DbcSummary } from "@/components/dbc-summary";
 import { DbcTable } from "@/components/dbc-table";
+import { DbcSignalLayoutChart } from "@/components/dbc-signal-layout-chart";
 import { useParseDbcFile } from "@/queries/dbc";
+import type { DbcMessage } from "@/api/dbc";
 import { cn } from "@/lib/utils";
 import { formatBinding, useCommandHandler, useEffectiveBinding, useScope } from "@/commands";
 
@@ -26,6 +35,7 @@ function HomeComponent() {
   const navigate = Route.useNavigate();
   const filterInputRef = useRef<HTMLInputElement>(null);
   const openBinding = useEffectiveBinding("file.open");
+  const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
 
   async function handleOpenDbcFile() {
     const path = await open({
@@ -69,6 +79,13 @@ function HomeComponent() {
         {parseDbcFile.isSuccess && (
           <div className="mt-3 space-y-4">
             <DbcSummary dbc={parseDbcFile.data} />
+            {parseDbcFile.data.messages.length > 0 && (
+              <SignalLayoutSection
+                messages={parseDbcFile.data.messages}
+                selectedMessageId={selectedMessageId}
+                onSelectMessageId={setSelectedMessageId}
+              />
+            )}
             <DbcTableScope>
               <DbcTable
                 dbc={parseDbcFile.data}
@@ -93,4 +110,40 @@ function HomeComponent() {
 function DbcTableScope({ children }: { children: ReactNode }) {
   useScope("dbc-table");
   return <>{children}</>;
+}
+
+function SignalLayoutSection({
+  messages,
+  selectedMessageId,
+  onSelectMessageId,
+}: {
+  messages: DbcMessage[];
+  selectedMessageId: string | null;
+  onSelectMessageId: (id: string) => void;
+}) {
+  const selectedMessage =
+    messages.find((message) => String(message.id) === selectedMessageId) ?? messages[0];
+
+  return (
+    <div className="space-y-3">
+      <Select
+        value={String(selectedMessage.id)}
+        onValueChange={(value) => {
+          if (value) onSelectMessageId(value);
+        }}
+      >
+        <SelectTrigger className="w-64">
+          <SelectValue placeholder="Select a message" />
+        </SelectTrigger>
+        <SelectContent>
+          {messages.map((message) => (
+            <SelectItem key={message.id} value={String(message.id)}>
+              {message.name}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <DbcSignalLayoutChart message={selectedMessage} />
+    </div>
+  );
 }
