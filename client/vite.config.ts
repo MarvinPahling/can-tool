@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
@@ -17,6 +18,7 @@ export default defineConfig(() => ({
       generatedRouteTree: "./src/routeTree.gen.ts",
     }),
     react(),
+    tailwindcss(),
   ],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
