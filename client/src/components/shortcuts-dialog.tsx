@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useHotkeyRecorder } from "@tanstack/react-hotkeys";
 import {
   COMMANDS,
@@ -7,6 +7,8 @@ import {
   isSequenceBinding,
   resetCommandBinding,
   setCommandBinding,
+  pushScope,
+  popScope,
   useCommandHandler,
   useEffectiveBinding,
 } from "@/commands";
@@ -70,6 +72,12 @@ export function ShortcutsDialog() {
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
 
   useCommandHandler("app.showShortcuts", () => setOpen(true));
+
+  useEffect(() => {
+    if (!open) return;
+    pushScope("dialog");
+    return () => popScope("dialog");
+  }, [open]);
 
   const recorder = useHotkeyRecorder({
     onRecord: (hotkey) => {

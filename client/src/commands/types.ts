@@ -10,7 +10,7 @@ import type {
  * a scoped command only fires while its scope is the topmost one on the stack
  * (see `src/commands/scopes.ts`).
  */
-export type CommandScope = "global" | "dbc-table";
+export type CommandScope = "global" | "dbc-table" | "dialog";
 
 /** A single chord (e.g. `"Mod+O"`) or a Vim-style sequence (e.g. `["G", "F"]`). */
 export type CommandBinding = RegisterableHotkey | Readonly<HotkeySequence>;
