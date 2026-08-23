@@ -1,7 +1,7 @@
 import type {
-  HotkeyOptions,
-  HotkeySequence,
-  RegisterableHotkey,
+	HotkeyOptions,
+	HotkeySequence,
+	RegisterableHotkey,
 } from "@tanstack/hotkeys";
 
 /**
@@ -16,9 +16,9 @@ export type CommandScope = "global" | "dbc-table" | "dialog";
 export type CommandBinding = RegisterableHotkey | Readonly<HotkeySequence>;
 
 export function isSequenceBinding(
-  binding: CommandBinding,
+	binding: CommandBinding,
 ): binding is Readonly<HotkeySequence> {
-  return Array.isArray(binding);
+	return Array.isArray(binding);
 }
 
 /**
@@ -28,13 +28,13 @@ export function isSequenceBinding(
  * without touching the code that implements the command.
  */
 export interface CommandDefinition {
-  id: string;
-  label: string;
-  description?: string;
-  /** Which input context this command's binding is active in. Omit for global commands. */
-  scope?: CommandScope;
-  /** The binding used unless the user has customized it (see `src/commands/bindings.ts`). */
-  defaultBinding: CommandBinding;
-  /** Overrides for the underlying hotkey/sequence registration options. */
-  hotkeyOptions?: Partial<HotkeyOptions>;
+	id: string;
+	label: string;
+	description?: string;
+	/** Which input context this command's binding is active in. Omit for global commands. */
+	scope?: CommandScope;
+	/** The binding used unless the user has customized it (see `src/commands/bindings.ts`). */
+	defaultBinding: CommandBinding;
+	/** Overrides for the underlying hotkey/sequence registration options. */
+	hotkeyOptions?: Partial<HotkeyOptions>;
 }

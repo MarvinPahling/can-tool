@@ -1,15 +1,21 @@
-import { useEffect } from "react";
-import type { ReactNode } from "react";
-import { HotkeysProvider, useHotkeys, useHotkeySequences } from "@tanstack/react-hotkeys";
-import type { UseHotkeyDefinition } from "@tanstack/react-hotkeys";
-import type { UseHotkeySequenceDefinition } from "@tanstack/react-hotkeys";
+import type {
+	UseHotkeyDefinition,
+	UseHotkeySequenceDefinition,
+} from "@tanstack/react-hotkeys";
+import {
+	HotkeysProvider,
+	useHotkeySequences,
+	useHotkeys,
+} from "@tanstack/react-hotkeys";
 import { useStore } from "@tanstack/react-store";
 import { listen } from "@tauri-apps/api/event";
-import { COMMANDS } from "./definitions";
+import type { ReactNode } from "react";
+import { useEffect } from "react";
 import { bindingOverridesStore, getEffectiveBinding } from "./bindings";
+import { COMMANDS } from "./definitions";
 import { isScopeActive, scopeStackStore } from "./scopes";
+import { type CommandDefinition, isSequenceBinding } from "./types";
 import { runCommand } from "./useCommand";
-import { isSequenceBinding, type CommandDefinition } from "./types";
 
 const ALL_COMMANDS: ReadonlyArray<CommandDefinition> = COMMANDS;
 
@@ -21,55 +27,55 @@ const ALL_COMMANDS: ReadonlyArray<CommandDefinition> = COMMANDS;
  * decides *whether* a key press should run it.
  */
 function CommandBindingsHost() {
-  useStore(bindingOverridesStore, (state) => state);
-  useStore(scopeStackStore, (state) => state);
+	useStore(bindingOverridesStore, (state) => state);
+	useStore(scopeStackStore, (state) => state);
 
-  const chordDefinitions: Array<UseHotkeyDefinition> = [];
-  const sequenceDefinitions: Array<UseHotkeySequenceDefinition> = [];
+	const chordDefinitions: Array<UseHotkeyDefinition> = [];
+	const sequenceDefinitions: Array<UseHotkeySequenceDefinition> = [];
 
-  for (const command of ALL_COMMANDS) {
-    const binding = getEffectiveBinding(command.id);
-    const enabled = isScopeActive(command.scope);
-    const callback = () => runCommand(command.id);
+	for (const command of ALL_COMMANDS) {
+		const binding = getEffectiveBinding(command.id);
+		const enabled = isScopeActive(command.scope);
+		const callback = () => runCommand(command.id);
 
-    if (isSequenceBinding(binding)) {
-      sequenceDefinitions.push({
-        sequence: [...binding],
-        callback,
-        options: { enabled, ...command.hotkeyOptions },
-      });
-    } else {
-      chordDefinitions.push({
-        hotkey: binding,
-        callback,
-        options: { enabled, ...command.hotkeyOptions },
-      });
-    }
-  }
+		if (isSequenceBinding(binding)) {
+			sequenceDefinitions.push({
+				sequence: [...binding],
+				callback,
+				options: { enabled, ...command.hotkeyOptions },
+			});
+		} else {
+			chordDefinitions.push({
+				hotkey: binding,
+				callback,
+				options: { enabled, ...command.hotkeyOptions },
+			});
+		}
+	}
 
-  useHotkeys(chordDefinitions);
-  useHotkeySequences(sequenceDefinitions);
+	useHotkeys(chordDefinitions);
+	useHotkeySequences(sequenceDefinitions);
 
-  // Native OS menu bar items (see src-tauri/src/lib.rs) share command ids
-  // with `COMMANDS`, so a click there runs the exact same implementation a
-  // keyboard shortcut would.
-  useEffect(() => {
-    const unlisten = listen<string>("menu-command", (event) => {
-      runCommand(event.payload);
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
+	// Native OS menu bar items (see src-tauri/src/lib.rs) share command ids
+	// with `COMMANDS`, so a click there runs the exact same implementation a
+	// keyboard shortcut would.
+	useEffect(() => {
+		const unlisten = listen<string>("menu-command", (event) => {
+			runCommand(event.payload);
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+		};
+	}, []);
 
-  return null;
+	return null;
 }
 
 export function CommandsProvider({ children }: { children: ReactNode }) {
-  return (
-    <HotkeysProvider>
-      <CommandBindingsHost />
-      {children}
-    </HotkeysProvider>
-  );
+	return (
+		<HotkeysProvider>
+			<CommandBindingsHost />
+			{children}
+		</HotkeysProvider>
+	);
 }

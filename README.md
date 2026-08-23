@@ -33,18 +33,20 @@ That's it. That's the install. If it doesn't work, it's almost certainly a Tauri
 All commands run from `client/`:
 
 ```bash
-just dev      # full Tauri app window, hot-reloaded (Rust backend + Vite frontend)
-just build    # production build, packaged as a desktop app
-just clean    # nuke build artifacts when something feels cursed
+just dev       # full Tauri app window, hot-reloaded (Rust backend + Vite frontend)
+just build     # production build, packaged as a desktop app
+just clean     # nuke build artifacts when something feels cursed
+just lint      # check formatting and lint rules with Biome
+just lint-fix  # same, but fixes what it safely can
 ```
 
-No `just`? Use `bun run tauri dev` / `bun run tauri build` instead.
+No `just`? Use `bun run tauri dev` / `bun run tauri build` / `bunx biome check .` instead.
 
 There's also `bun run dev` for the frontend alone (Vite only, no Tauri window, no Rust backend) — useful for UI work when you don't feel like waiting on a Rust compile.
 
 ## Testing
 
-There isn't any. There is no test runner configured. There is no linter configured. We are, as previously established, vibing. Type errors from `tsc` and `cargo check` are the closest thing to a safety net you're going to get, so at least run those before you commit something embarrassing.
+There isn't any. There is no test runner configured. We are, as previously established, vibing. There is a linter — [Biome](https://biomejs.dev), configured in `biome.json` — so at least run `just lint` (and `tsc` / `cargo check` for type errors) before you commit something embarrassing.
 
 ## Contributing
 

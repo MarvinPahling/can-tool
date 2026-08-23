@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import { Store, useStore } from "@tanstack/react-store";
+import { useEffect } from "react";
 import type { CommandScope } from "./types";
 
 /**
@@ -12,25 +12,27 @@ import type { CommandScope } from "./types";
 export const scopeStackStore = new Store<Array<CommandScope>>(["global"]);
 
 export function pushScope(scope: CommandScope): void {
-  scopeStackStore.setState((prev) => [...prev, scope]);
+	scopeStackStore.setState((prev) => [...prev, scope]);
 }
 
 export function popScope(scope: CommandScope): void {
-  scopeStackStore.setState((prev) => {
-    const index = prev.lastIndexOf(scope);
-    return index === -1 ? prev : [...prev.slice(0, index), ...prev.slice(index + 1)];
-  });
+	scopeStackStore.setState((prev) => {
+		const index = prev.lastIndexOf(scope);
+		return index === -1
+			? prev
+			: [...prev.slice(0, index), ...prev.slice(index + 1)];
+	});
 }
 
 export function isScopeActive(scope: CommandScope | undefined): boolean {
-  if (!scope || scope === "global") return true;
-  const stack = scopeStackStore.state;
-  return stack[stack.length - 1] === scope;
+	if (!scope || scope === "global") return true;
+	const stack = scopeStackStore.state;
+	return stack[stack.length - 1] === scope;
 }
 
 /** React hook returning whether `scope` is currently the active (topmost) scope. */
 export function useIsScopeActive(scope: CommandScope | undefined): boolean {
-  return useStore(scopeStackStore, () => isScopeActive(scope));
+	return useStore(scopeStackStore, () => isScopeActive(scope));
 }
 
 /**
@@ -39,8 +41,8 @@ export function useIsScopeActive(scope: CommandScope | undefined): boolean {
  * scoped commands active only while that view is showing.
  */
 export function useScope(scope: CommandScope): void {
-  useEffect(() => {
-    pushScope(scope);
-    return () => popScope(scope);
-  }, [scope]);
+	useEffect(() => {
+		pushScope(scope);
+		return () => popScope(scope);
+	}, [scope]);
 }

@@ -13,3 +13,9 @@ clean:
 gen-icon:
     cd ./src-tauri/ && bunx tauri icon --output ./icons/ ./icons/net.svg
 
+lint:
+    bunx biome check .
+
+lint-fix:
+    bunx biome check --write .
+

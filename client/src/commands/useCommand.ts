@@ -17,32 +17,35 @@ const handlers = new Map<string, CommandHandler>();
  * changes) — the most recently mounted implementation wins, and unmounting
  * restores whatever was registered before it, if anything.
  */
-export function useCommandHandler(commandId: string, handler: CommandHandler): void {
-  if (import.meta.env.DEV && !COMMANDS_BY_ID[commandId]) {
-    console.warn(`useCommandHandler: unknown command id "${commandId}"`);
-  }
+export function useCommandHandler(
+	commandId: string,
+	handler: CommandHandler,
+): void {
+	if (import.meta.env.DEV && !COMMANDS_BY_ID[commandId]) {
+		console.warn(`useCommandHandler: unknown command id "${commandId}"`);
+	}
 
-  const handlerRef = useRef(handler);
-  handlerRef.current = handler;
+	const handlerRef = useRef(handler);
+	handlerRef.current = handler;
 
-  useEffect(() => {
-    const previous = handlers.get(commandId);
-    handlers.set(commandId, () => handlerRef.current());
-    return () => {
-      if (previous) {
-        handlers.set(commandId, previous);
-      } else {
-        handlers.delete(commandId);
-      }
-    };
-  }, [commandId]);
+	useEffect(() => {
+		const previous = handlers.get(commandId);
+		handlers.set(commandId, () => handlerRef.current());
+		return () => {
+			if (previous) {
+				handlers.set(commandId, previous);
+			} else {
+				handlers.delete(commandId);
+			}
+		};
+	}, [commandId]);
 }
 
 /** Runs a command's currently-attached implementation, if any is mounted. */
 export function runCommand(commandId: string): void {
-  handlers.get(commandId)?.();
+	handlers.get(commandId)?.();
 }
 
 export function hasCommandHandler(commandId: string): boolean {
-  return handlers.has(commandId);
+	return handlers.has(commandId);
 }

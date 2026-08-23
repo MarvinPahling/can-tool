@@ -1,15 +1,15 @@
 import {
-  columnFilteringFeature,
-  createExpandedRowModel,
-  createFilteredRowModel,
-  createSortedRowModel,
-  filterFn_includesString,
-  globalFilteringFeature,
-  rowExpandingFeature,
-  rowSortingFeature,
-  sortFn_alphanumeric,
-  sortFn_text,
-  tableFeatures,
+	columnFilteringFeature,
+	createExpandedRowModel,
+	createFilteredRowModel,
+	createSortedRowModel,
+	filterFn_includesString,
+	globalFilteringFeature,
+	rowExpandingFeature,
+	rowSortingFeature,
+	sortFn_alphanumeric,
+	sortFn_text,
+	tableFeatures,
 } from "@tanstack/react-table";
 
 /**
@@ -19,15 +19,15 @@ import {
  * headless pattern — never recreated per render.
  */
 export const dbcTableFeatures = tableFeatures({
-  rowExpandingFeature,
-  columnFilteringFeature,
-  globalFilteringFeature,
-  rowSortingFeature,
-  expandedRowModel: createExpandedRowModel(),
-  filteredRowModel: createFilteredRowModel(),
-  sortedRowModel: createSortedRowModel(),
-  filterFns: { includesString: filterFn_includesString },
-  sortFns: { alphanumeric: sortFn_alphanumeric, text: sortFn_text },
+	rowExpandingFeature,
+	columnFilteringFeature,
+	globalFilteringFeature,
+	rowSortingFeature,
+	expandedRowModel: createExpandedRowModel(),
+	filteredRowModel: createFilteredRowModel(),
+	sortedRowModel: createSortedRowModel(),
+	filterFns: { includesString: filterFn_includesString },
+	sortFns: { alphanumeric: sortFn_alphanumeric, text: sortFn_text },
 });
 
 export type DbcTableFeatures = typeof dbcTableFeatures;
