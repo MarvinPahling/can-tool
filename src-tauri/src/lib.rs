@@ -2,8 +2,9 @@ mod can;
 mod dbc;
 
 use can::{
-    can_connection_status, connect_can_device, disconnect_can_device, encode_can_message,
-    generate_checksum, list_can_devices, send_can_frame, send_can_message, CanState,
+    autodetect_bitrate, can_connection_status, connect_can_device, disconnect_can_device,
+    encode_can_message, generate_checksum, list_can_devices, send_can_frame, send_can_message,
+    CanState,
 };
 use dbc::parse_dbc_file;
 use tauri::{
@@ -31,6 +32,7 @@ pub fn run() {
             parse_dbc_file,
             list_can_devices,
             connect_can_device,
+            autodetect_bitrate,
             disconnect_can_device,
             can_connection_status,
             encode_can_message,

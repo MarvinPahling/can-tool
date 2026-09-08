@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serialport::{SerialPort, SerialPortType};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
 
@@ -16,6 +16,23 @@ const CANABLE_VID: u16 = 0xad50;
 const CANABLE_PID: u16 = 0x60c4;
 
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bitrates the auto-detect sweep tries, in descending order of how often they
+/// turn up in the wild rather than numeric order, so the usual answer is the
+/// first one tried.
+const PROBE_BITRATES: [u32; 9] = [
+    500_000, 250_000, 125_000, 1_000_000, 100_000, 800_000, 50_000, 20_000, 10_000,
+];
+
+/// A single frame can be garbage decoded at the wrong bitrate; two rarely are.
+const PROBE_MIN_FRAMES: usize = 2;
+
+/// How long to listen at each candidate bitrate before moving on.
+const PROBE_DWELL: Duration = Duration::from_millis(400);
+
+/// Shorter than `SERIAL_TIMEOUT`, so one blocking read cannot overrun the dwell
+/// and stall the progress the UI is rendering.
+const PROBE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Serialize)]
 pub struct CanDeviceInfo {
@@ -33,6 +50,18 @@ pub struct CanConnectionStatus {
     /// Opened in slcan listen-only mode: the adapter receives but never
     /// transmits or ACKs, so every send path is refused.
     pub read_only: bool,
+}
+
+/// One `can-probe` event: the bitrate being tried and what it has seen so far.
+#[derive(Serialize, Clone)]
+pub struct ProbeProgress {
+    pub bitrate: u32,
+    pub frames: usize,
+    /// True on the final event of a sweep, whatever the outcome.
+    pub done: bool,
+    /// Set only on the final event: the winning bitrate, or `None` if the sweep
+    /// found nothing.
+    pub detected: Option<u32>,
 }
 
 struct CanConnection {
@@ -56,7 +85,32 @@ impl CanConnection {
 }
 
 #[derive(Default)]
-pub struct CanState(Mutex<Option<CanConnection>>);
+pub struct CanState {
+    connection: Mutex<Option<CanConnection>>,
+    /// Set while a bitrate sweep owns the port. The sweep cannot simply hold
+    /// `connection` for its whole run: `can_connection_status` is polled once a
+    /// second from the main thread, and blocking that is what freezes the UI.
+    probing: AtomicBool,
+}
+
+/// Claims the probing flag and clears it on drop, so an early `?` return in the
+/// middle of a sweep cannot leave the app permanently refusing to connect.
+struct ProbeGuard<'a>(&'a AtomicBool);
+
+impl<'a> ProbeGuard<'a> {
+    fn claim(state: &'a CanState) -> Result<Self, String> {
+        if state.probing.swap(true, Ordering::Relaxed) {
+            return Err("A bitrate sweep is already running".to_string());
+        }
+        Ok(Self(&state.probing))
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 #[tauri::command]
 pub fn list_can_devices() -> Result<Vec<CanDeviceInfo>, String> {
@@ -109,6 +163,11 @@ fn open_command(read_only: bool) -> &'static str {
     }
 }
 
+/// Whether a candidate bitrate saw enough traffic to call it the right one.
+fn probe_hit(frames: usize) -> bool {
+    frames >= PROBE_MIN_FRAMES
+}
+
 /// Refuses the transmit paths on a listen-only connection. The adapter would
 /// swallow the frame anyway, so failing loudly beats sending into a void.
 fn ensure_writable(status: &CanConnectionStatus) -> Result<(), String> {
@@ -126,17 +185,18 @@ fn write_slcan_command(port: &mut Box<dyn SerialPort>, command: &str) -> Result<
     port.flush().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn connect_can_device(
+/// Opens the port, configures the slcan channel and starts the reader thread.
+/// Shared by `connect_can_device` and the reconnect at the end of a bitrate
+/// sweep, so the two paths cannot drift apart.
+fn open_connection(
     app: AppHandle,
-    state: State<CanState>,
-    port_name: String,
+    port_name: &str,
     bitrate: u32,
     read_only: bool,
-) -> Result<(), String> {
+) -> Result<CanConnection, String> {
     let code = bitrate_code(bitrate)?;
 
-    let mut port = serialport::new(&port_name, 115_200)
+    let mut port = serialport::new(port_name, 115_200)
         .timeout(SERIAL_TIMEOUT)
         .open()
         .map_err(|e| format!("Failed to open {port_name}: {e}"))?;
@@ -151,8 +211,39 @@ pub fn connect_can_device(
         .try_clone()
         .map_err(|e| format!("Failed to open a read handle on {port_name}: {e}"))?;
 
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
+    Ok(CanConnection {
+        port,
+        status: CanConnectionStatus {
+            port_name: port_name.to_string(),
+            bitrate,
+            read_only,
+        },
+        stop,
+        reader: Some(reader),
+    })
+}
+
+#[tauri::command]
+pub fn connect_can_device(
+    app: AppHandle,
+    state: State<CanState>,
+    port_name: String,
+    bitrate: u32,
+    read_only: bool,
+) -> Result<(), String> {
+    // Racy by nature — the sweep could claim the flag right after this check —
+    // but the loser then just fails to open the port, with a clearer message
+    // than the OS would give.
+    if state.probing.load(Ordering::Relaxed) {
+        return Err("A bitrate sweep is running; wait for it to finish".to_string());
+    }
+
+    let connection = open_connection(app, &port_name, bitrate, read_only)?;
+
     let mut guard = state
-        .0
+        .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
 
@@ -161,25 +252,153 @@ pub fn connect_can_device(
         previous.stop_reader();
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
-    *guard = Some(CanConnection {
-        port,
-        status: CanConnectionStatus {
-            port_name,
-            bitrate,
-            read_only,
-        },
-        stop,
-        reader: Some(reader),
-    });
+    *guard = Some(connection);
     Ok(())
+}
+
+/// Listens at one candidate bitrate and reports how many valid frames arrived.
+/// Opens its own short-lived handle: the sweep runs with no connection in
+/// `CanState`, so there is no reader thread to share with.
+fn probe_bitrate(port_name: &str, bitrate: u32, read_only: bool) -> Result<usize, String> {
+    let code = bitrate_code(bitrate)?;
+
+    let mut port = serialport::new(port_name, 115_200)
+        .timeout(PROBE_READ_TIMEOUT)
+        .open()
+        .map_err(|e| format!("Failed to open {port_name}: {e}"))?;
+
+    let _ = write_slcan_command(&mut port, "C");
+    write_slcan_command(&mut port, &format!("S{code}"))?;
+    write_slcan_command(&mut port, open_command(read_only))?;
+
+    let mut raw = [0u8; 1024];
+    let mut buf = String::new();
+    let mut frames = 0usize;
+    let deadline = Instant::now() + PROBE_DWELL;
+
+    while Instant::now() < deadline {
+        match port.read(&mut raw) {
+            // A zero-length read would otherwise spin this loop hot.
+            Ok(0) => thread::sleep(Duration::from_millis(1)),
+            Ok(n) => {
+                buf.push_str(&String::from_utf8_lossy(&raw[..n]));
+                // Rejections are ignored: at the wrong bitrate the adapter
+                // produces plenty of them, and they are not evidence either way.
+                frames += drain_lines(&mut buf, now_ms()).frames.len();
+            }
+            // Timeouts are how a silent bus looks — keep listening.
+            Err(e) if e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("Failed to read {port_name}: {e}")),
+        }
+    }
+
+    let _ = write_slcan_command(&mut port, "C");
+    Ok(frames)
+}
+
+/// The sweep itself, run on a blocking worker rather than the main thread.
+///
+/// The `connection` mutex is taken only twice — once to hand the port over, and
+/// once to install the result — never for the duration. Holding it across the
+/// whole sweep would block `can_connection_status`, which the UI polls every
+/// second from the main thread, and that is exactly what froze the app.
+/// Overlapping sweeps and connects are kept apart by the probing flag instead.
+fn run_bitrate_sweep(
+    app: &AppHandle,
+    state: &CanState,
+    port_name: &str,
+    read_only: bool,
+) -> Result<Option<u32>, String> {
+    let _probing = ProbeGuard::claim(state)?;
+
+    // The OS will not grant a second exclusive open, so a live connection has
+    // to be torn down before the probe can have the port.
+    if let Some(mut previous) = state
+        .connection
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?
+        .take()
+    {
+        previous.stop_reader();
+        let _ = write_slcan_command(&mut previous.port, "C");
+    }
+
+    let mut detected = None;
+    let mut last = (0u32, 0usize);
+
+    for bitrate in PROBE_BITRATES {
+        let _ = app.emit(
+            "can-probe",
+            ProbeProgress {
+                bitrate,
+                frames: 0,
+                done: false,
+                detected: None,
+            },
+        );
+
+        let frames = probe_bitrate(port_name, bitrate, read_only)?;
+        last = (bitrate, frames);
+
+        let _ = app.emit(
+            "can-probe",
+            ProbeProgress {
+                bitrate,
+                frames,
+                done: false,
+                detected: None,
+            },
+        );
+
+        if probe_hit(frames) {
+            detected = Some(bitrate);
+            break;
+        }
+    }
+
+    let _ = app.emit(
+        "can-probe",
+        ProbeProgress {
+            bitrate: last.0,
+            frames: last.1,
+            done: true,
+            detected,
+        },
+    );
+
+    // Leave the user connected at what the sweep found.
+    if let Some(bitrate) = detected {
+        let connection = open_connection(app.clone(), port_name, bitrate, read_only)?;
+        *state
+            .connection
+            .lock()
+            .map_err(|_| "CAN state poisoned".to_string())? = Some(connection);
+    }
+
+    Ok(detected)
+}
+
+#[tauri::command]
+pub async fn autodetect_bitrate(
+    app: AppHandle,
+    port_name: String,
+    read_only: bool,
+) -> Result<Option<u32>, String> {
+    // Sync Tauri commands run on the main thread, so a multi-second sweep there
+    // freezes the webview. `spawn_blocking` moves it off, and the awaited
+    // handle still resolves the invoke with the detected bitrate.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<CanState>();
+        run_bitrate_sweep(&app, &state, &port_name, read_only)
+    })
+    .await
+    .map_err(|e| format!("Auto-detect worker failed: {e}"))?
 }
 
 #[tauri::command]
 pub fn disconnect_can_device(state: State<CanState>) -> Result<(), String> {
     let mut guard = state
-        .0
+        .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     if let Some(mut connection) = guard.take() {
@@ -194,7 +413,7 @@ pub fn can_connection_status(
     state: State<CanState>,
 ) -> Result<Option<CanConnectionStatus>, String> {
     let guard = state
-        .0
+        .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     Ok(guard.as_ref().map(|c| c.status.clone()))
@@ -588,7 +807,7 @@ pub fn send_can_frame(
     data: Vec<u8>,
 ) -> Result<(), String> {
     let mut guard = state
-        .0
+        .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
@@ -604,7 +823,7 @@ pub fn send_can_message(
 ) -> Result<(), String> {
     let data = encode_can_message(message.clone(), values)?;
     let mut guard = state
-        .0
+        .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
@@ -652,6 +871,49 @@ mod tests {
             bitrate: 500_000,
             read_only,
         }
+    }
+
+    #[test]
+    fn probe_guard_clears_the_flag_even_on_an_early_return() {
+        let state = CanState::default();
+
+        let result: Result<(), String> = (|| {
+            let _probing = ProbeGuard::claim(&state)?;
+            assert!(state.probing.load(Ordering::Relaxed));
+            // A second sweep must not start while the first holds the flag.
+            assert!(ProbeGuard::claim(&state).is_err());
+            Err("probe failed halfway".to_string())
+        })();
+
+        assert!(result.is_err());
+        assert!(
+            !state.probing.load(Ordering::Relaxed),
+            "an early return must not leave the app refusing connects"
+        );
+        assert!(ProbeGuard::claim(&state).is_ok());
+    }
+
+    #[test]
+    fn probe_hit_needs_more_than_one_frame() {
+        assert!(!probe_hit(0));
+        assert!(!probe_hit(PROBE_MIN_FRAMES - 1));
+        assert!(probe_hit(PROBE_MIN_FRAMES));
+        assert!(probe_hit(PROBE_MIN_FRAMES + 10));
+    }
+
+    #[test]
+    fn every_probed_bitrate_has_an_slcan_code() {
+        for bitrate in PROBE_BITRATES {
+            assert!(
+                bitrate_code(bitrate).is_ok(),
+                "{bitrate} is probed but has no slcan code"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_tries_the_common_bitrates_first() {
+        assert_eq!(&PROBE_BITRATES[..3], &[500_000, 250_000, 125_000]);
     }
 
     #[test]

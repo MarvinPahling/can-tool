@@ -9,24 +9,39 @@ import {
 import { DeviceConnectDialog } from "./device-connect-dialog";
 
 const {
+	autodetectMutate,
 	connectMutate,
+	emitProgress,
+	useAutodetectBitrate,
 	useConnectCanDevice,
 	useConnectionStatus,
 	useDisconnectCanDevice,
 	useListCanDevices,
-} = vi.hoisted(() => ({
-	connectMutate: vi.fn(),
-	useConnectCanDevice: vi.fn(),
-	useConnectionStatus: vi.fn(),
-	useDisconnectCanDevice: vi.fn(),
-	useListCanDevices: vi.fn(),
-}));
+	useProbeProgress,
+} = vi.hoisted(() => {
+	let handler: ((progress: unknown) => void) | undefined;
+	return {
+		autodetectMutate: vi.fn(),
+		connectMutate: vi.fn(),
+		useAutodetectBitrate: vi.fn(),
+		useConnectCanDevice: vi.fn(),
+		useConnectionStatus: vi.fn(),
+		useDisconnectCanDevice: vi.fn(),
+		useListCanDevices: vi.fn(),
+		useProbeProgress: vi.fn((cb: (progress: unknown) => void) => {
+			handler = cb;
+		}),
+		emitProgress: (progress: unknown) => handler?.(progress),
+	};
+});
 
 vi.mock("@/queries/can", () => ({
+	useAutodetectBitrate,
 	useConnectCanDevice,
 	useConnectionStatus,
 	useDisconnectCanDevice,
 	useListCanDevices,
+	useProbeProgress,
 }));
 
 const device = {
@@ -59,6 +74,10 @@ beforeEach(() => {
 		isError: false,
 	});
 	useDisconnectCanDevice.mockReturnValue({ mutate: vi.fn(), isPending: false });
+	useAutodetectBitrate.mockReturnValue({
+		mutate: autodetectMutate,
+		isPending: false,
+	});
 });
 
 afterEach(() => {
@@ -132,5 +151,100 @@ describe("DeviceConnectDialog", () => {
 
 		const alert = await screen.findByText(/500,000 bit\/s/);
 		expect(alert.textContent).not.toMatch(/read-only/i);
+	});
+
+	describe("auto-detecting the bitrate", () => {
+		it("is disabled until a port is selected", async () => {
+			useListCanDevices.mockReturnValue({
+				data: [],
+				isFetching: false,
+				refetch: vi.fn(),
+			});
+			await openDialog();
+
+			expect(screen.getByRole("button", { name: /^auto$/i })).toBeDisabled();
+		});
+
+		it("sweeps the selected port with the current read-only setting", async () => {
+			const toggle = await openDialog();
+			await userEvent.click(toggle);
+
+			await userEvent.click(screen.getByRole("button", { name: /^auto$/i }));
+
+			expect(autodetectMutate).toHaveBeenCalledWith(
+				{ portName: device.port_name, readOnly: true },
+				expect.anything(),
+			);
+		});
+
+		it("reports which bitrate is being tried and what it heard", async () => {
+			await openDialog();
+
+			await act(async () => {
+				emitProgress({
+					bitrate: 250_000,
+					frames: 14,
+					done: false,
+					detected: null,
+				});
+			});
+
+			expect(screen.getByText(/250 kbit\/s/)).toBeInTheDocument();
+			expect(screen.getByText(/14 frames/)).toBeInTheDocument();
+		});
+
+		it("selects the detected bitrate and clears the progress line", async () => {
+			autodetectMutate.mockImplementation(
+				(_vars: unknown, opts: { onSuccess?: (v: number | null) => void }) =>
+					opts.onSuccess?.(250_000),
+			);
+			await openDialog();
+			await act(async () => {
+				emitProgress({
+					bitrate: 250_000,
+					frames: 14,
+					done: false,
+					detected: null,
+				});
+			});
+
+			await userEvent.click(screen.getByRole("button", { name: /^auto$/i }));
+
+			expect(screen.queryByText(/14 frames/)).not.toBeInTheDocument();
+			await userEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+			expect(connectMutate).toHaveBeenCalledWith(
+				expect.objectContaining({ bitrate: 250_000 }),
+			);
+		});
+
+		it("shows a spinner and locks both buttons while sweeping", async () => {
+			useAutodetectBitrate.mockReturnValue({
+				mutate: autodetectMutate,
+				isPending: true,
+			});
+			await openDialog();
+
+			const auto = screen.getByRole("button", { name: /detecting/i });
+			expect(auto).toBeDisabled();
+			expect(auto.querySelector(".animate-spin")).toBeTruthy();
+			// Connecting mid-sweep would fight the sweep for the port.
+			expect(screen.getByRole("button", { name: /^connect$/i })).toBeDisabled();
+		});
+
+		it("keeps the failure on screen and leaves the bitrate alone", async () => {
+			autodetectMutate.mockImplementation(
+				(_vars: unknown, opts: { onSuccess?: (v: number | null) => void }) =>
+					opts.onSuccess?.(null),
+			);
+			await openDialog();
+
+			await userEvent.click(screen.getByRole("button", { name: /^auto$/i }));
+
+			expect(screen.getByText(/no traffic/i)).toBeInTheDocument();
+			await userEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+			expect(connectMutate).toHaveBeenCalledWith(
+				expect.objectContaining({ bitrate: 500_000 }),
+			);
+		});
 	});
 });

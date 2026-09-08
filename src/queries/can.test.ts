@@ -1,7 +1,7 @@
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CanFrame } from "../api/can";
-import { useCanFrames } from "./can";
+import type { CanFrame, ProbeProgress } from "../api/can";
+import { useCanFrames, useProbeProgress } from "./can";
 
 const { listen, unlisten, emit } = vi.hoisted(() => {
 	// Captures the handler `listen` was called with, so tests can emit into it.
@@ -75,6 +75,55 @@ describe("useCanFrames", () => {
 		// callback receives the batch — a re-subscribe would drop frames.
 		expect(listen).toHaveBeenCalledTimes(1);
 		expect(second).toHaveBeenCalledWith([frame]);
+		expect(first).not.toHaveBeenCalled();
+	});
+});
+
+const progress: ProbeProgress = {
+	bitrate: 250_000,
+	frames: 14,
+	done: false,
+	detected: null,
+};
+
+describe("useProbeProgress", () => {
+	it("subscribes to the can-probe event once on mount", () => {
+		renderHook(() => useProbeProgress(() => {}));
+
+		expect(listen).toHaveBeenCalledTimes(1);
+		expect(listen.mock.calls[0]?.[0]).toBe("can-probe");
+	});
+
+	it("hands each emitted update to the callback", () => {
+		const onProgress = vi.fn();
+		renderHook(() => useProbeProgress(onProgress));
+
+		emit(progress);
+
+		expect(onProgress).toHaveBeenCalledWith(progress);
+	});
+
+	it("unlistens on unmount", async () => {
+		const { unmount } = renderHook(() => useProbeProgress(() => {}));
+		await vi.waitFor(() => expect(listen).toHaveBeenCalled());
+
+		unmount();
+
+		await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
+	});
+
+	it("does not resubscribe when the callback identity changes", () => {
+		const first = vi.fn();
+		const second = vi.fn();
+		const { rerender } = renderHook(({ cb }) => useProbeProgress(cb), {
+			initialProps: { cb: first },
+		});
+
+		rerender({ cb: second });
+		emit(progress);
+
+		expect(listen).toHaveBeenCalledTimes(1);
+		expect(second).toHaveBeenCalledWith(progress);
 		expect(first).not.toHaveBeenCalled();
 	});
 });

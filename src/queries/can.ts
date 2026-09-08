@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
-import type { CanFrame } from "../api/can";
+import type { CanFrame, ProbeProgress } from "../api/can";
 import {
+	autodetectBitrate,
 	canConnectionStatus,
 	connectCanDevice,
 	disconnectCanDevice,
@@ -41,6 +42,28 @@ export function useConnectCanDevice() {
 			bitrate: number;
 			readOnly: boolean;
 		}) => connectCanDevice(portName, bitrate, readOnly),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["can", "status"] });
+			queryClient.invalidateQueries({ queryKey: ["can", "devices"] });
+		},
+	});
+}
+
+/**
+ * Runs a bitrate sweep on one port. Resolves to the detected bitrate, or null
+ * when nothing was heard; on a hit the backend leaves the device connected at
+ * that rate, hence the same invalidations as a plain connect.
+ */
+export function useAutodetectBitrate() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			portName,
+			readOnly,
+		}: {
+			portName: string;
+			readOnly: boolean;
+		}) => autodetectBitrate(portName, readOnly),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["can", "status"] });
 			queryClient.invalidateQueries({ queryKey: ["can", "devices"] });
@@ -109,6 +132,33 @@ export function useCanFrames(onFrames: (frames: CanFrame[]) => void) {
 		}).then((fn) => {
 			// `listen` resolves asynchronously; if the effect was already torn
 			// down by then, unlisten immediately rather than leaking it.
+			if (cancelled) fn();
+			else unlisten = fn;
+		});
+
+		return () => {
+			cancelled = true;
+			unlisten?.();
+		};
+	}, []);
+}
+
+/** Subscribes to bitrate-sweep progress; see `useCanFrames` for the pattern. */
+export function useProbeProgress(
+	onProgress: (progress: ProbeProgress) => void,
+) {
+	const handler = useRef(onProgress);
+	useEffect(() => {
+		handler.current = onProgress;
+	});
+
+	useEffect(() => {
+		let cancelled = false;
+		let unlisten: (() => void) | undefined;
+
+		listen<ProbeProgress>("can-probe", (event) => {
+			handler.current(event.payload);
+		}).then((fn) => {
 			if (cancelled) fn();
 			else unlisten = fn;
 		});
