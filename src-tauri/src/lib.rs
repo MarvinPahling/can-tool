@@ -2,8 +2,9 @@ mod can;
 mod dbc;
 
 use can::{
-    can_connection_status, connect_can_device, disconnect_can_device, encode_can_message,
-    generate_checksum, list_can_devices, send_can_frame, send_can_message, CanState,
+    autodetect_bitrate, can_connection_status, connect_can_device, disconnect_can_device,
+    encode_can_message, generate_checksum, list_can_devices, send_can_frame, send_can_message,
+    CanState,
 };
 use dbc::parse_dbc_file;
 use tauri::{
@@ -31,6 +32,7 @@ pub fn run() {
             parse_dbc_file,
             list_can_devices,
             connect_can_device,
+            autodetect_bitrate,
             disconnect_can_device,
             can_connection_status,
             encode_can_message,
@@ -65,6 +67,18 @@ pub fn run() {
                 .item(&PredefinedMenuItem::close_window(handle, None)?)
                 .build()?;
 
+            let view_dbc = MenuItemBuilder::with_id("view.dbc", "DBC Browser")
+                .accelerator("CmdOrCtrl+1")
+                .build(handle)?;
+            let view_visualize = MenuItemBuilder::with_id("view.visualize", "Live Traffic")
+                .accelerator("CmdOrCtrl+2")
+                .build(handle)?;
+
+            let view_menu = SubmenuBuilder::new(handle, "View")
+                .item(&view_dbc)
+                .item(&view_visualize)
+                .build()?;
+
             let edit_menu = SubmenuBuilder::new(handle, "Edit")
                 .undo()
                 .redo()
@@ -79,6 +93,7 @@ pub fn run() {
                 .item(&app_menu)
                 .item(&file_menu)
                 .item(&edit_menu)
+                .item(&view_menu)
                 .build()
         })
         .on_menu_event(|app, event| {

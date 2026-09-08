@@ -1,3 +1,4 @@
+import { Link, useNavigate } from "@tanstack/react-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Keyboard, Minus, Send, Square, Usb, X } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -10,11 +11,19 @@ import { useConnectionStatus } from "@/queries/can";
 
 const appWindow = getCurrentWindow();
 
+const NAV_LINKS = [
+	{ to: "/", label: "DBC" },
+	{ to: "/visualize", label: "Live" },
+] as const;
+
 export function Titlebar() {
 	const [isMaximized, setIsMaximized] = useState(false);
 	const status = useConnectionStatus();
+	const navigate = useNavigate();
 
 	useCommandHandler("app.toggleTheme", cycleTheme);
+	useCommandHandler("view.dbc", () => navigate({ to: "/" }));
+	useCommandHandler("view.visualize", () => navigate({ to: "/visualize" }));
 
 	useEffect(() => {
 		appWindow.isMaximized().then(setIsMaximized);
@@ -38,6 +47,21 @@ export function Titlebar() {
 				<span className="text-xs font-medium text-sidebar-foreground">
 					CAN Tool
 				</span>
+				<nav className="ml-4 flex items-center gap-1">
+					{NAV_LINKS.map((link) => (
+						<Link
+							key={link.to}
+							to={link.to}
+							className="rounded-sm px-2 py-0.5 text-xs text-muted-foreground hover:text-sidebar-foreground"
+							activeProps={{
+								className: "bg-sidebar-accent text-sidebar-accent-foreground",
+							}}
+							activeOptions={{ exact: true }}
+						>
+							{link.label}
+						</Link>
+					))}
+				</nav>
 			</div>
 			<div className="flex h-full items-center">
 				<ThemeToggle />

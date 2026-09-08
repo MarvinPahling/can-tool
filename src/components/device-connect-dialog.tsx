@@ -1,4 +1,4 @@
-import { RefreshCw } from "lucide-react";
+import { LoaderCircle, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { popScope, pushScope, useCommandHandler } from "@/commands";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -18,12 +18,16 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { useConnectSettings } from "@/hooks/use-connect-settings";
 import { cn } from "@/lib/utils";
 import {
+	useAutodetectBitrate,
 	useConnectCanDevice,
 	useConnectionStatus,
 	useDisconnectCanDevice,
 	useListCanDevices,
+	useProbeProgress,
 } from "@/queries/can";
 
 const BITRATES = [
@@ -38,10 +42,20 @@ const BITRATES = [
 	{ value: 1_000_000, label: "1 Mbit/s" },
 ];
 
+function formatBitrate(value: number) {
+	return (
+		BITRATES.find((option) => option.value === value)?.label ??
+		`${value.toLocaleString()} bit/s`
+	);
+}
+
 export function DeviceConnectDialog() {
 	const [open, setOpen] = useState(false);
 	const [selectedPort, setSelectedPort] = useState<string | null>(null);
 	const [bitrate, setBitrate] = useState(500_000);
+	// Persisted, unlike the port and bitrate: read-only is a property of the
+	// bus you are on, so it is almost always the same choice every session.
+	const { settings, setSettings } = useConnectSettings();
 
 	useCommandHandler("device.connect", () => setOpen(true));
 
@@ -51,10 +65,52 @@ export function DeviceConnectDialog() {
 		return () => popScope("dialog");
 	}, [open]);
 
+	// Transient: what the running sweep is trying, or how it ended. `null` once
+	// there is nothing to say.
+	const [probeStatus, setProbeStatus] = useState<string | null>(null);
+
 	const devices = useListCanDevices(open);
 	const status = useConnectionStatus();
 	const connect = useConnectCanDevice();
 	const disconnect = useDisconnectCanDevice();
+	const autodetect = useAutodetectBitrate();
+
+	useProbeProgress((progress) => {
+		if (progress.done) return;
+		setProbeStatus(
+			`Trying ${formatBitrate(progress.bitrate)} — ${progress.frames} ${
+				progress.frames === 1 ? "frame" : "frames"
+			}`,
+		);
+	});
+
+	function handleAutodetect() {
+		if (!selectedPort) return;
+		setProbeStatus("Starting…");
+		autodetect.mutate(
+			{ portName: selectedPort, readOnly: settings.readOnly },
+			{
+				onSuccess: (detected) => {
+					if (detected === null) {
+						// Deliberately left on screen: a silent bus and a wrong
+						// adapter setup look identical from here, so the user has to
+						// read this one.
+						setProbeStatus(
+							"No traffic found at any bitrate. The bus may be idle, or the adapter may not be on it.",
+						);
+						return;
+					}
+					setBitrate(detected);
+					setProbeStatus(null);
+				},
+				onError: (error) => {
+					setProbeStatus(
+						error instanceof Error ? error.message : "Auto-detect failed",
+					);
+				},
+			},
+		);
+	}
 
 	const isConnected = Boolean(status.data);
 
@@ -81,7 +137,7 @@ export function DeviceConnectDialog() {
 						<AlertTitle>Connected</AlertTitle>
 						<AlertDescription>
 							{status.data.port_name} @ {status.data.bitrate.toLocaleString()}{" "}
-							bit/s
+							bit/s{status.data.read_only && " · read-only"}
 						</AlertDescription>
 					</Alert>
 				)}
@@ -144,6 +200,23 @@ export function DeviceConnectDialog() {
 					)}
 				</div>
 
+				{/* biome-ignore lint/a11y/noLabelWithoutControl: the Switch it wraps is the control, behind a component boundary biome cannot see through */}
+				<label className="flex items-start justify-between gap-3">
+					<span className="min-w-0">
+						<span className="block text-sm font-medium">Read-only mode</span>
+						<span className="block text-xs text-muted-foreground">
+							Receive only; the adapter will not transmit or ACK. Some adapters
+							stop receiving entirely in this mode.
+						</span>
+					</span>
+					<Switch
+						checked={settings.readOnly}
+						onCheckedChange={(checked: boolean) =>
+							setSettings({ readOnly: checked })
+						}
+					/>
+				</label>
+
 				<div className="flex items-center gap-2">
 					<Select
 						value={String(bitrate)}
@@ -166,6 +239,23 @@ export function DeviceConnectDialog() {
 						</SelectContent>
 					</Select>
 
+					<Button
+						variant="outline"
+						onClick={handleAutodetect}
+						disabled={
+							!selectedPort || autodetect.isPending || connect.isPending
+						}
+					>
+						{autodetect.isPending ? (
+							<>
+								<LoaderCircle className="size-4 animate-spin" />
+								Detecting…
+							</>
+						) : (
+							"Auto"
+						)}
+					</Button>
+
 					{isConnected ? (
 						<Button
 							variant="destructive"
@@ -178,14 +268,24 @@ export function DeviceConnectDialog() {
 						<Button
 							onClick={() =>
 								selectedPort &&
-								connect.mutate({ portName: selectedPort, bitrate })
+								connect.mutate({
+									portName: selectedPort,
+									bitrate,
+									readOnly: settings.readOnly,
+								})
 							}
-							disabled={!selectedPort || connect.isPending}
+							disabled={
+								!selectedPort || connect.isPending || autodetect.isPending
+							}
 						>
 							{connect.isPending ? "Connecting…" : "Connect"}
 						</Button>
 					)}
 				</div>
+
+				{probeStatus && (
+					<p className="text-xs text-muted-foreground">{probeStatus}</p>
+				)}
 			</DialogContent>
 		</Dialog>
 	);

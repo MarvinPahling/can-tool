@@ -26,5 +26,11 @@
 		"noFallthroughCasesInSwitch": true
 	},
 	"include": ["src"],
+	// Both generated and unimported: the api layer pulls `commands`/`types`
+	// directly rather than through the barrel, and the query hooks call `listen`
+	// themselves (matching useCanFrames) rather than using the event helpers.
+	// `events.ts` ships an unused type import that would trip noUnusedLocals,
+	// and generated files must never be hand-edited.
+	"exclude": ["src/generated/index.ts", "src/generated/events.ts"],
 	"references": [{ "path": "./tsconfig.node.json" }]
 }
