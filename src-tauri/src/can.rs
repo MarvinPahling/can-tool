@@ -1,11 +1,13 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::io::{ErrorKind, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serialport::{SerialPort, SerialPortType};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
 
@@ -33,6 +35,21 @@ pub struct CanConnectionStatus {
 struct CanConnection {
     port: Box<dyn SerialPort>,
     status: CanConnectionStatus,
+    /// Signals the reader thread to exit; see `stop_reader`.
+    stop: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl CanConnection {
+    /// Stops the reader thread and waits for it to exit, so a reconnect can
+    /// never leave a second thread reading the same port. The join costs at
+    /// most one read timeout.
+    fn stop_reader(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -87,6 +104,7 @@ fn write_slcan_command(port: &mut Box<dyn SerialPort>, command: &str) -> Result<
 
 #[tauri::command]
 pub fn connect_can_device(
+    app: AppHandle,
     state: State<CanState>,
     port_name: String,
     bitrate: u32,
@@ -103,13 +121,28 @@ pub fn connect_can_device(
     write_slcan_command(&mut port, &format!("S{code}"))?;
     write_slcan_command(&mut port, "O")?;
 
+    // The reader gets its own handle so it never contends with the writer.
+    let rx_port = port
+        .try_clone()
+        .map_err(|e| format!("Failed to open a read handle on {port_name}: {e}"))?;
+
     let mut guard = state
         .0
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
+
+    // Reconnecting must not leave the previous reader running.
+    if let Some(previous) = guard.as_mut() {
+        previous.stop_reader();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
     *guard = Some(CanConnection {
         port,
         status: CanConnectionStatus { port_name, bitrate },
+        stop,
+        reader: Some(reader),
     });
     Ok(())
 }
@@ -121,6 +154,7 @@ pub fn disconnect_can_device(state: State<CanState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     if let Some(mut connection) = guard.take() {
+        connection.stop_reader();
         let _ = write_slcan_command(&mut connection.port, "C");
     }
     Ok(())
@@ -296,11 +330,8 @@ pub fn generate_checksum(
     Ok((crc as f64) * signal.factor + signal.offset)
 }
 
-// TODO(#2): drop these `dead_code` allows once the reader thread consumes
-// the parser. Until then nothing calls into the receive path.
 /// One CAN frame, either received from the bus or about to be written to it.
 #[derive(Serialize, Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub struct CanFrame {
     pub id: u32,
     pub extended: bool,
@@ -309,9 +340,7 @@ pub struct CanFrame {
 }
 
 /// The widest id each frame format can carry: 11 bits standard, 29 extended.
-#[allow(dead_code)]
 const MAX_STANDARD_ID: u32 = 0x7FF;
-#[allow(dead_code)]
 const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
 
 /// Formats a frame as an slcan/LAWICEL transmit command (without the trailing
@@ -338,7 +367,6 @@ fn format_slcan_frame(id: u32, extended: bool, data: &[u8]) -> String {
 ///
 /// `timestamp_ms` is left at 0 for the caller to stamp, keeping this pure so
 /// its tests need neither hardware nor a clock.
-#[allow(dead_code)]
 fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
     let line = line.trim();
     if !line.is_ascii() {
@@ -398,12 +426,113 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
 
 /// Strict hex parse: unlike `from_str_radix`, rejects a leading `+`/`-` sign
 /// so a line like `t+101FF` is not mistaken for a frame.
-#[allow(dead_code)]
 fn parse_hex(hex: &str) -> Option<u32> {
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
+}
+
+/// How often the reader flushes buffered frames to the frontend, and the
+/// batch size that forces an early flush. A busy 500 kbit/s bus produces
+/// thousands of frames a second; emitting one event each would swamp the
+/// webview, so they go over in ~33 batches/s instead.
+const RX_FLUSH_INTERVAL: Duration = Duration::from_millis(30);
+const RX_BATCH_CAP: usize = 256;
+
+/// Guards against unbounded growth if the adapter ever streams bytes with no
+/// line terminator in sight.
+const RX_BUFFER_LIMIT: usize = 4096;
+
+/// What one read off the port yielded: the frames it completed, and how many
+/// transmit rejections the adapter reported.
+#[derive(Default, Debug)]
+struct RxBatch {
+    frames: Vec<CanFrame>,
+    rejections: usize,
+}
+
+/// Splits every *complete* line out of `buf`, leaving a trailing partial line
+/// behind so a frame split across two reads is reassembled rather than lost.
+///
+/// Lines end in `\r`, or in the BEL byte the adapter sends to reject a frame
+/// we transmitted. BEL is counted rather than parsed: it is the ack that
+/// `write_frame` used to read inline, and which now belongs to this thread.
+fn drain_lines(buf: &mut String, timestamp_ms: u64) -> RxBatch {
+    let mut batch = RxBatch::default();
+    let Some(end) = buf.rfind(['\r', '\u{7}']) else {
+        if buf.len() > RX_BUFFER_LIMIT {
+            buf.clear();
+        }
+        return batch;
+    };
+
+    let complete: String = buf.drain(..=end).collect();
+    for line in complete.split_inclusive(['\r', '\u{7}']) {
+        if line.ends_with('\u{7}') {
+            batch.rejections += 1;
+        }
+        if let Some(mut frame) = parse_slcan_frame(line) {
+            frame.timestamp_ms = timestamp_ms;
+            batch.frames.push(frame);
+        }
+    }
+    batch
+}
+
+/// Whether buffered frames should go out now — either the batching window
+/// elapsed or the batch grew large enough that waiting would add latency.
+fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
+    pending > 0 && (pending >= RX_BATCH_CAP || since_last_flush >= RX_FLUSH_INTERVAL)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Reads the port until `stop` is set, emitting batched `can-frames` events.
+///
+/// Owns its own handle (a `try_clone` of the connection's port) so it never
+/// contends with `write_frame` for the `CanState` mutex.
+fn spawn_reader(
+    app: AppHandle,
+    mut port: Box<dyn SerialPort>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut raw = [0u8; 1024];
+        let mut buf = String::new();
+        let mut pending: Vec<CanFrame> = Vec::new();
+        let mut last_flush = Instant::now();
+
+        while !stop.load(Ordering::Relaxed) {
+            match port.read(&mut raw) {
+                // A zero-length read would otherwise spin this loop hot.
+                Ok(0) => thread::sleep(Duration::from_millis(1)),
+                Ok(n) => {
+                    buf.push_str(&String::from_utf8_lossy(&raw[..n]));
+                    let batch = drain_lines(&mut buf, now_ms());
+                    if batch.rejections > 0 {
+                        let _ = app.emit("can-error", "Adapter rejected a frame");
+                    }
+                    pending.extend(batch.frames);
+                }
+                // Timeouts are how an idle bus looks — keep waiting.
+                Err(e) if e.kind() == ErrorKind::TimedOut => {}
+                // Anything else means the port is gone (unplugged, closed).
+                Err(_) => break,
+            }
+
+            if should_flush(pending.len(), last_flush.elapsed()) {
+                let _ = app.emit("can-frames", &pending);
+                pending.clear();
+                last_flush = Instant::now();
+            }
+        }
+    })
 }
 
 fn write_frame(
@@ -415,14 +544,11 @@ fn write_frame(
     if data.len() > 8 {
         return Err("CAN frames support at most 8 data bytes".to_string());
     }
-    write_slcan_command(port, &format_slcan_frame(id, extended, data))?;
-
-    // Read back the single-byte ack ('\r' success, BEL 0x07 error).
-    let mut ack = [0u8; 1];
-    match port.read_exact(&mut ack) {
-        Ok(()) if ack[0] == 0x07 => Err("Adapter rejected the frame".to_string()),
-        _ => Ok(()),
-    }
+    // The ack (`\r` success, BEL 0x07 rejection) is deliberately not read
+    // here: the reader thread owns the incoming byte stream, and racing it
+    // for that byte would corrupt both sides. It surfaces a rejection as a
+    // `can-error` event instead, so this returns as soon as the write lands.
+    write_slcan_command(port, &format_slcan_frame(id, extended, data))
 }
 
 #[tauri::command]
@@ -735,5 +861,80 @@ mod tests {
             assert_eq!(frame.extended, extended);
             assert_eq!(frame.data, data);
         }
+    }
+
+    #[test]
+    fn drain_lines_extracts_complete_frames_and_keeps_the_partial() {
+        let mut buf = String::from("t1A01FF\rt1A01EE\rt1A0");
+        let batch = drain_lines(&mut buf, 42);
+        assert_eq!(batch.frames.len(), 2);
+        assert_eq!(batch.frames[0].data, vec![0xFF]);
+        assert_eq!(batch.frames[1].data, vec![0xEE]);
+        // The trailing partial line stays behind for the next read.
+        assert_eq!(buf, "t1A0");
+    }
+
+    #[test]
+    fn drain_lines_reassembles_a_frame_split_across_two_reads() {
+        let mut buf = String::new();
+
+        buf.push_str("t1A08DEAD");
+        let batch = drain_lines(&mut buf, 1);
+        assert!(batch.frames.is_empty(), "no terminator yet");
+
+        buf.push_str("BEEF00112233\r");
+        let batch = drain_lines(&mut buf, 2);
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(
+            batch.frames[0].data,
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_lines_stamps_every_frame_with_the_given_timestamp() {
+        let mut buf = String::from("t1A01FF\rt1A01EE\r");
+        let batch = drain_lines(&mut buf, 1234);
+        assert!(batch.frames.iter().all(|f| f.timestamp_ms == 1234));
+    }
+
+    #[test]
+    fn drain_lines_counts_bel_as_a_rejection_not_a_frame() {
+        // The adapter answers a transmit command with BEL when it rejects it.
+        let mut buf = String::from("\u{7}t1A01FF\r");
+        let batch = drain_lines(&mut buf, 0);
+        assert_eq!(batch.rejections, 1);
+        assert_eq!(batch.frames.len(), 1);
+    }
+
+    #[test]
+    fn drain_lines_ignores_empty_and_unparsable_lines() {
+        // A bare ack, a version reply and garbage all sit in the same stream.
+        let mut buf = String::from("\rV1010\rgarbage\rt1A01FF\r");
+        let batch = drain_lines(&mut buf, 0);
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.rejections, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_lines_returns_nothing_when_no_line_is_complete() {
+        let mut buf = String::from("t1A01F");
+        let batch = drain_lines(&mut buf, 0);
+        assert!(batch.frames.is_empty());
+        assert_eq!(buf, "t1A01F", "the buffer is left untouched");
+    }
+
+    #[test]
+    fn should_flush_batches_until_the_interval_or_the_cap() {
+        // Nothing buffered: never flush, however long it has been.
+        assert!(!should_flush(0, Duration::from_secs(1)));
+        // Buffered but still inside the window: keep batching.
+        assert!(!should_flush(1, Duration::from_millis(5)));
+        // The interval elapsed.
+        assert!(should_flush(1, RX_FLUSH_INTERVAL));
+        // The cap is reached before the interval, so a burst flushes early.
+        assert!(should_flush(RX_BATCH_CAP, Duration::from_millis(0)));
     }
 }
