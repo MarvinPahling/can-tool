@@ -23,7 +23,7 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { useParseDbcFile } from "@/queries/dbc";
+import { useCurrentDbc, useParseDbcFile } from "@/queries/dbc";
 
 const searchSchema = z.object({
 	q: z.string().optional(),
@@ -36,6 +36,10 @@ export const Route = createFileRoute("/")({
 
 function HomeComponent() {
 	const parseDbcFile = useParseDbcFile();
+	// Rendering from the shared cache rather than from the mutation keeps the
+	// loaded file around when this route unmounts on navigation; the mutation
+	// only drives the pending and error states of the current open action.
+	const dbcFile = useCurrentDbc().data;
 	const { q = "" } = Route.useSearch();
 	const navigate = Route.useNavigate();
 	const filterInputRef = useRef<HTMLInputElement>(null);
@@ -69,7 +73,7 @@ function HomeComponent() {
 	useCommandHandler("table.focusFilter", () => filterInputRef.current?.focus());
 
 	return (
-		<div className={cn("p-4", !parseDbcFile.isSuccess && "mx-auto max-w-xl")}>
+		<div className={cn("p-4", !dbcFile && "mx-auto max-w-xl")}>
 			<h1 className="text-xl font-semibold">CAN Tool</h1>
 
 			<div className="mt-6">
@@ -91,13 +95,13 @@ function HomeComponent() {
 					</Alert>
 				)}
 
-				{parseDbcFile.isSuccess && (
+				{dbcFile && (
 					<div className="mt-3 space-y-4">
-						<DbcSummary dbc={parseDbcFile.data} />
+						<DbcSummary dbc={dbcFile} />
 						<div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_420px] lg:items-start">
 							<DbcTableScope>
 								<DbcTable
-									dbc={parseDbcFile.data}
+									dbc={dbcFile}
 									globalFilter={q}
 									onGlobalFilterChange={(value) =>
 										navigate({
@@ -110,10 +114,10 @@ function HomeComponent() {
 									onSignalHover={handleSignalHover}
 								/>
 							</DbcTableScope>
-							{parseDbcFile.data.messages.length > 0 && (
+							{dbcFile.messages.length > 0 && (
 								<div className="lg:sticky lg:top-4">
 									<SignalLayoutSection
-										messages={parseDbcFile.data.messages}
+										messages={dbcFile.messages}
 										selectedMessageId={selectedMessageId}
 										onSelectMessageId={setSelectedMessageId}
 										hoveredSignal={hoveredSignal}
