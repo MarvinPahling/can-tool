@@ -15,6 +15,21 @@ import type {
 
 export type { CanConnectionStatus, CanDeviceInfo };
 
+/**
+ * One CAN frame received from the bus, as carried by the `can-frames` event.
+ *
+ * Hand-written rather than re-exported from `src/generated/`: tauri-typegen
+ * derives its types from `#[tauri::command]` signatures, and a frame only ever
+ * travels over an event, so it never appears there. Keep this in sync with
+ * `CanFrame` in `src-tauri/src/can.rs`.
+ */
+export interface CanFrame {
+	id: number;
+	extended: boolean;
+	data: number[];
+	timestamp_ms: number;
+}
+
 export async function listCanDevices(): Promise<CanDeviceInfo[]> {
 	return listCanDevicesCommand();
 }
