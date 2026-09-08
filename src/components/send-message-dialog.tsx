@@ -24,6 +24,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { usePendingSendMessage } from "@/lib/pending-send";
 import { getSignalRange } from "@/lib/signal-range";
+import { bytesToHex } from "@/lib/utils";
 import {
 	useConnectionStatus,
 	useGenerateChecksum,
@@ -38,12 +39,6 @@ interface FrameValues {
 
 interface SendFormValues {
 	frames: FrameValues[];
-}
-
-function bytesToHex(bytes: number[]): string {
-	return bytes
-		.map((b) => b.toString(16).padStart(2, "0").toUpperCase())
-		.join(" ");
 }
 
 export function SendMessageDialog() {
@@ -345,6 +340,7 @@ function FrameRow({
 												: undefined;
 
 										return isBoolean ? (
+											// biome-ignore lint/a11y/noLabelWithoutControl: the Switch it wraps is the control, behind a component boundary biome cannot see through
 											<label className="flex items-center justify-between gap-2 text-xs">
 												<span className="text-muted-foreground">
 													{signal.name}
@@ -365,6 +361,7 @@ function FrameRow({
 												)}
 											</label>
 										) : (
+											// biome-ignore lint/a11y/noLabelWithoutControl: the Input it wraps is the control, behind a component boundary biome cannot see through
 											<label className="flex flex-col gap-0.5 text-xs">
 												<span className="flex items-baseline justify-between gap-1 text-muted-foreground">
 													<span>
