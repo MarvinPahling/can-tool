@@ -296,6 +296,116 @@ pub fn generate_checksum(
     Ok((crc as f64) * signal.factor + signal.offset)
 }
 
+// TODO(#2): drop these `dead_code` allows once the reader thread consumes
+// the parser. Until then nothing calls into the receive path.
+/// One CAN frame, either received from the bus or about to be written to it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub struct CanFrame {
+    pub id: u32,
+    pub extended: bool,
+    pub data: Vec<u8>,
+    pub timestamp_ms: u64,
+}
+
+/// The widest id each frame format can carry: 11 bits standard, 29 extended.
+#[allow(dead_code)]
+const MAX_STANDARD_ID: u32 = 0x7FF;
+#[allow(dead_code)]
+const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
+
+/// Formats a frame as an slcan/LAWICEL transmit command (without the trailing
+/// `\r`, which `write_slcan_command` appends).
+fn format_slcan_frame(id: u32, extended: bool, data: &[u8]) -> String {
+    let hex_data: String = data.iter().map(|b| format!("{b:02X}")).collect();
+    if extended {
+        format!("T{id:08X}{}{hex_data}", data.len())
+    } else {
+        format!("t{id:03X}{}{hex_data}", data.len())
+    }
+}
+
+/// Parses a single slcan line into a frame — the inverse of
+/// `format_slcan_frame`, and the entry point for everything arriving from the
+/// bus.
+///
+/// `t<3-hex-id><len><hexdata>` and `T<8-hex-id><len><hexdata>` are data
+/// frames; `r`/`R` are their remote-request counterparts and carry no payload.
+/// Anything else the adapter may send — a bare `\r`, the BEL byte it uses to
+/// reject a transmitted frame, a `V1010` version reply, truncated or non-hex
+/// digits, or a DLC that disagrees with the payload — is not a frame and
+/// yields `None`.
+///
+/// `timestamp_ms` is left at 0 for the caller to stamp, keeping this pure so
+/// its tests need neither hardware nor a clock.
+#[allow(dead_code)]
+fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
+    let line = line.trim();
+    if !line.is_ascii() {
+        return None;
+    }
+
+    let (kind, rest) = line.split_at_checked(1)?;
+    let (extended, remote) = match kind {
+        "t" => (false, false),
+        "T" => (true, false),
+        "r" => (false, true),
+        "R" => (true, true),
+        _ => return None,
+    };
+
+    let (id_hex, rest) = rest.split_at_checked(if extended { 8 } else { 3 })?;
+    let id = parse_hex(id_hex)?;
+    let max_id = if extended {
+        MAX_EXTENDED_ID
+    } else {
+        MAX_STANDARD_ID
+    };
+    if id > max_id {
+        return None;
+    }
+
+    let (len_hex, payload) = rest.split_at_checked(1)?;
+    let len = parse_hex(len_hex)? as usize;
+    if len > 8 {
+        return None;
+    }
+
+    // A remote frame declares a length but carries no bytes.
+    let data = if remote {
+        if !payload.is_empty() {
+            return None;
+        }
+        Vec::new()
+    } else {
+        if payload.len() != len * 2 {
+            return None;
+        }
+        payload
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| parse_hex(std::str::from_utf8(pair).ok()?).map(|b| b as u8))
+            .collect::<Option<Vec<u8>>>()?
+    };
+
+    Some(CanFrame {
+        id,
+        extended,
+        data,
+        timestamp_ms: 0,
+    })
+}
+
+/// Strict hex parse: unlike `from_str_radix`, rejects a leading `+`/`-` sign
+/// so a line like `t+101FF` is not mistaken for a frame.
+#[allow(dead_code)]
+fn parse_hex(hex: &str) -> Option<u32> {
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 fn write_frame(
     port: &mut Box<dyn SerialPort>,
     id: u32,
@@ -305,13 +415,7 @@ fn write_frame(
     if data.len() > 8 {
         return Err("CAN frames support at most 8 data bytes".to_string());
     }
-    let hex_data: String = data.iter().map(|b| format!("{b:02X}")).collect();
-    let command = if extended {
-        format!("T{id:08X}{}{hex_data}", data.len())
-    } else {
-        format!("t{id:03X}{}{hex_data}", data.len())
-    };
-    write_slcan_command(port, &command)?;
+    write_slcan_command(port, &format_slcan_frame(id, extended, data))?;
 
     // Read back the single-byte ack ('\r' success, BEL 0x07 error).
     let mut ack = [0u8; 1];
@@ -518,5 +622,118 @@ mod tests {
         let msg = message(vec![signal(|s| s.name = "Data".to_string())]);
         let result = generate_checksum(msg, HashMap::new(), "Nope".to_string());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_a_standard_data_frame() {
+        let frame = parse_slcan_frame("t1A08DEADBEEF00112233").unwrap();
+        assert_eq!(frame.id, 0x1A0);
+        assert!(!frame.extended);
+        assert_eq!(
+            frame.data,
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]
+        );
+        assert_eq!(frame.timestamp_ms, 0);
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_an_extended_data_frame() {
+        let frame = parse_slcan_frame("T18DAF1102AABB").unwrap();
+        assert_eq!(frame.id, 0x18DAF110);
+        assert!(frame.extended);
+        assert_eq!(frame.data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_a_zero_length_frame() {
+        let frame = parse_slcan_frame("t2000").unwrap();
+        assert_eq!(frame.id, 0x200);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_remote_frames_without_payload() {
+        let standard = parse_slcan_frame("r1238").unwrap();
+        assert_eq!(standard.id, 0x123);
+        assert!(!standard.extended);
+        assert!(standard.data.is_empty());
+
+        let extended = parse_slcan_frame("R000001238").unwrap();
+        assert_eq!(extended.id, 0x123);
+        assert!(extended.extended);
+        assert!(extended.data.is_empty());
+    }
+
+    #[test]
+    fn parse_slcan_frame_tolerates_a_trailing_carriage_return() {
+        let frame = parse_slcan_frame("t1A01FF\r").unwrap();
+        assert_eq!(frame.id, 0x1A0);
+        assert_eq!(frame.data, vec![0xFF]);
+    }
+
+    #[test]
+    fn parse_slcan_frame_rejects_non_frame_lines() {
+        // The BEL byte the adapter sends to reject a transmitted frame.
+        assert!(parse_slcan_frame("\u{7}").is_none());
+        assert!(parse_slcan_frame("").is_none());
+        assert!(parse_slcan_frame("\r").is_none());
+        // Version/serial-number replies.
+        assert!(parse_slcan_frame("V1010").is_none());
+        assert!(parse_slcan_frame("NA123").is_none());
+        assert!(parse_slcan_frame("garbage").is_none());
+    }
+
+    #[test]
+    fn parse_slcan_frame_rejects_malformed_hex() {
+        // Non-hex digits in the id, the length, and the payload.
+        assert!(parse_slcan_frame("tZZZ1FF").is_none());
+        assert!(parse_slcan_frame("t1A0ZFF").is_none());
+        assert!(parse_slcan_frame("t1A01GG").is_none());
+        // `from_str_radix` would happily accept a leading sign; we must not.
+        assert!(parse_slcan_frame("t+101FF").is_none());
+    }
+
+    #[test]
+    fn parse_slcan_frame_rejects_a_dlc_that_disagrees_with_the_payload() {
+        // Says 4 bytes, carries 1.
+        assert!(parse_slcan_frame("t1A04FF").is_none());
+        // Says 1 byte, carries 2.
+        assert!(parse_slcan_frame("t1A01FFEE").is_none());
+        // Truncated id.
+        assert!(parse_slcan_frame("t1A").is_none());
+        // Missing length nibble.
+        assert!(parse_slcan_frame("t1A0").is_none());
+        // A DLC above the 8-byte classic CAN maximum.
+        assert!(parse_slcan_frame("t1A09FFFFFFFFFFFFFFFFFF").is_none());
+        // Remote frames carry no payload.
+        assert!(parse_slcan_frame("r1231FF").is_none());
+    }
+
+    #[test]
+    fn parse_slcan_frame_rejects_ids_wider_than_their_frame_format() {
+        // 0x800 does not fit in an 11-bit standard id.
+        assert!(parse_slcan_frame("t8000").is_none());
+        // 0x20000000 does not fit in a 29-bit extended id.
+        assert!(parse_slcan_frame("T200000000").is_none());
+    }
+
+    #[test]
+    fn slcan_frames_round_trip_through_format_and_parse() {
+        for (id, extended, data) in [
+            (0x1A0u32, false, vec![0xDE, 0xAD]),
+            (0x7FF, false, vec![]),
+            (
+                0x18DAF110,
+                true,
+                vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            ),
+        ] {
+            let line = format_slcan_frame(id, extended, &data);
+            let frame =
+                parse_slcan_frame(&line).unwrap_or_else(|| panic!("failed to parse {line:?}"));
+            assert_eq!(frame.id, id);
+            assert_eq!(frame.extended, extended);
+            assert_eq!(frame.data, data);
+        }
     }
 }
