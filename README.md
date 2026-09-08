@@ -4,7 +4,18 @@
 
 A desktop app for poking at CAN FD buses, brought to you by the ancient and time-honored engineering practice of vibe coding. No, that's not a disclaimer buried in the fine print — it's the whole methodology. There is no design doc. There was never a design doc. There is an `AGENTS.md` that an AI wrote to explain the codebase to other AIs, which should tell you everything you need to know.
 
-It mostly works. Load a `.dbc` file, browse messages and signals, stare at a very satisfying grid of colored bits. More CAN FD functionality (actual bus connections, live frame streaming, signal decoding) is "expected to grow" here, in the sense that someone will eventually vibe it into existence.
+It mostly works, and it works on more than it used to. The bus connections, live frame streaming and signal decoding that earlier versions of this README described as "expected to grow" have since been vibed into existence; what's left on that list is logging and replay, adapters that aren't slcan, and a macOS build Apple is willing to admit exists.
+
+## Features
+
+- **DBC browsing** — load a `.dbc` file and get a sortable, filterable table of every message and signal in it. The filter lives in the URL, so you can bookmark a search. You won't, but you can.
+- **Signal bit grid** — a colored bit layout of the selected message, with hovering synced both ways between the grid and the table. This is the part everyone actually stares at, and if we're honest it's the reason the app exists at all.
+- **Adapter connection** — finds CANable-compatible adapters (slcan firmware), lists the serial ports, offers nine bitrates from 10 kbit/s to 1 Mbit/s. One adapter family, supported thoroughly, which is more than can be said for most of this codebase.
+- **Bitrate auto-detection** — can't remember whether it's 500k or 250k? Neither can we, so it tries each one and counts frames until something makes sense. Brute force, but the bus doesn't have to know.
+- **Read-only mode** — a listen-only toggle for when you'd rather not be the reason the car does something. It's the one setting in that dialog that persists between sessions, because it's the one where forgetting has consequences.
+- **Live traffic** — one card per CAN id at `/visualize`, decoded signals flashing as they change, raw payload underneath. Ids that aren't in your DBC still get a card, since unknown traffic is usually what you came looking for. Redraws are capped at 20 Hz, on the theory that neither you nor React can keep up past that.
+- **Sending frames** — build a message signal by signal (or Cmd-click a row in the table to start from it), watch the encoded payload update in hex as you type, batch several frames together, and let it fill in the checksum field, which it does correctly more often than a human doing it by hand at 1am.
+- **Rebindable shortcuts and dark mode** — conflict detection on the keybindings, chord sequences (`G` then `F` focuses the filter), and a theme toggle. Dark mode was never up for debate.
 
 ## Stack
 
