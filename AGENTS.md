@@ -8,7 +8,7 @@ A Tauri desktop app for interacting with a CAN FD bus.
 
 Frontend: React + TanStack Router + TanStack Query + Tailwind + shadcn/ui (base-ui style). Backend: Rust via Tauri 2. Package managers: bun (JS) and cargo (Rust). Task runner: `justfile`.
 
-The starter scaffold's CRUD demo (posts) has been removed. The only domain feature so far is opening and parsing a DBC file (`src-tauri/src/dbc.rs`, driven by the `can-dbc` crate) and browsing it (message/signal table, per-message bit layout) — see "DBC feature" below. Expect this to grow into full CAN FD functionality (bus connections, frame streaming, live signal decoding, etc.) as the project develops.
+The starter scaffold's CRUD demo (posts) has been removed. Two domain features exist so far: opening and parsing a DBC file (`src-tauri/src/dbc.rs`, driven by the `can-dbc` crate) and browsing it, and connecting to a CAN adapter to send and receive frames — see "DBC feature" and "Live traffic feature" below. Expect this to grow into fuller CAN FD functionality as the project develops.
 
 ## Commands
 
@@ -64,13 +64,13 @@ Each domain has a `queries/<domain>.ts` module built on:
 
 ### Routing
 
-TanStack Router with file-based routes under `src/routes/`, code-generated into `routeTree.gen.ts` (do not hand-edit). Route loaders call `queryClient.ensureQueryData(...)` using the shared query-options factories so navigation and preloading populate the Query cache before render; components then read via `useSuspenseQuery`. Search-param state (filters, pagination) is validated with `zod` schemas in `validateSearch` and kept in the URL rather than component state. The router is configured in `src/router.tsx` (`defaultPreload: "intent"`, shared pending/error components).
+TanStack Router with file-based routes under `src/routes/`, code-generated into `routeTree.gen.ts` (do not hand-edit). Two routes today: `/` (DBC browser) and `/visualize` (live traffic). Navigation lives in `src/components/titlebar.tsx` as `<Link>`s, mirrored by the `view.dbc`/`view.visualize` commands and a native View menu. Route loaders call `queryClient.ensureQueryData(...)` using the shared query-options factories so navigation and preloading populate the Query cache before render; components then read via `useSuspenseQuery`. Search-param state (filters, pagination) is validated with `zod` schemas in `validateSearch` and kept in the URL rather than component state. The router is configured in `src/router.tsx` (`defaultPreload: "intent"`, shared pending/error components).
 
 ### UI components
 
-shadcn/ui components (base-ui style, "mist" base color) live in `src/components/ui/` (currently: `button`, `card`, `alert`, `badge`, `input`, `select`, `dialog`, `dropdown-menu`, `table`), configured via `components.json`. Follow shadcn conventions when adding new primitives (`bunx shadcn add <component>`). General principle: build the frontend from small reusable components rather than large page-specific ones.
+shadcn/ui components (base-ui style, "mist" base color) live in `src/components/ui/` (currently: `alert`, `badge`, `button`, `card`, `dialog`, `dropdown-menu`, `input`, `label`, `popover`, `select`, `separator`, `slider`, `switch`, `table`), configured via `components.json`. Follow shadcn conventions when adding new primitives (`bunx shadcn add <component>`). General principle: build the frontend from small reusable components rather than large page-specific ones.
 
-Custom-chrome window: the OS titlebar is disabled (see `tauri.conf.json`) and replaced by `src/components/titlebar.tsx`, which drags via `data-tauri-drag-region` and drives `@tauri-apps/api/window`'s `getCurrentWindow()` for minimize/maximize/close, plus hosts `ThemeToggle` and the shortcuts-dialog trigger. `src/routes/__root.tsx` renders `Titlebar` above the routed content.
+Custom-chrome window: the OS titlebar is disabled (see `tauri.conf.json`) and replaced by `src/components/titlebar.tsx`, which drags via `data-tauri-drag-region` and drives `@tauri-apps/api/window`'s `getCurrentWindow()` for minimize/maximize/close, plus hosts the route nav links, `ThemeToggle` and the shortcuts-dialog trigger. `src/routes/__root.tsx` renders `Titlebar` above the routed content.
 
 ### Theming
 
@@ -111,4 +111,25 @@ The only implemented domain feature: pick a `.dbc` file from disk, parse it into
 - `src/components/dbc-table.tsx` — expandable message → signal table built on `@tanstack/react-table`'s `useTable`; row shapes (`MessageRow`/`SignalRow`) and expansion come from `src/lib/dbc-table/rows.ts`, columns from `src/lib/dbc-table/columns.tsx`, and enabled table features from `src/lib/dbc-table/features.ts`. Global filter is controlled by the route (URL-backed), not owned by the table.
 - `src/components/signal-bit-grid.tsx` — renders one message's bytes as a grid of per-bit boxes, colored by owning signal (`src/lib/signal-colors.ts`) with a legend below; bit ownership comes from `src/lib/signal-bits.ts`'s `buildSignalBitMap`, which implements DBC's big-/little-endian bit-numbering to map each signal to its occupied bit indices.
 
-To extend this (e.g. decode live frames), keep the same shape: extend `DbcFile`/related structs in `dbc.rs`, regenerate bindings, then add focused presentational components under `src/components/` (following the shadcn-primitives-first, reusable-components guidance above) rather than growing `index.tsx` directly.
+To extend this, keep the same shape: extend `DbcFile`/related structs in `dbc.rs`, regenerate bindings, then add focused presentational components under `src/components/` (following the shadcn-primitives-first, reusable-components guidance above) rather than growing `index.tsx` directly.
+
+## Live traffic feature
+
+The `/visualize` route decodes incoming frames against the loaded DBC and shows one card per CAN id, with changed values flashing in a configurable highlight that fades back.
+
+**Receive path (`src-tauri/src/can.rs`)**
+- `parse_slcan_frame(line) -> Option<CanFrame>` parses `t`/`T` data and `r`/`R` remote frames, rejecting adapter chatter (bare `\r`, the BEL rejection byte, version replies, bad hex, DLC/payload mismatch, over-wide ids). `format_slcan_frame` is its transmit counterpart, shared with `write_frame`.
+- `connect_can_device` spawns a reader thread over `port.try_clone()`, so the reader never contends with the writer for the `CanState` mutex. `drain_lines` splits complete lines out of the read buffer (keeping a trailing partial for the next read) and `should_flush` gates batching; frames go to the frontend as a `can-frames` event roughly every 30 ms or every 256 frames.
+- Teardown sets an `AtomicBool` and joins the thread; reconnecting stops the previous reader first.
+- **`write_frame` does not read the transmit ack.** That read raced the reader thread for the same bytes. The reader recognizes the BEL rejection and emits `can-error` instead, so sends no longer report adapter rejection synchronously.
+- `CanFrame` is event-only, so tauri-typegen (which derives from command signatures) does not emit it; it is hand-declared in `src/api/can.ts` and must be kept in sync.
+
+**Frontend**
+- `src/queries/can.ts` — `useCanFrames(onFrames)` wraps the event, holding the callback in a ref so a re-rendering consumer does not re-subscribe.
+- `src/lib/decode-message.ts` — `decodeSignal`/`decodeMessage`, the inverse of `encode_can_message`, reusing `getSignalBitIndices`. Uses arithmetic rather than bitwise operators (which coerce to 32 bits), gates multiplexed signals on the multiplexor's *raw* value, and omits signals that overrun the frame. Only single-level multiplexing is resolved.
+- `src/lib/signal-change.ts` — `hasSignificantChange`, the highlight gate. The threshold is a percentage of the signal's full physical range (via `getSignalRange`), not of the previous value, which is undefined when that value is 0.
+- `src/lib/live-messages.ts` — `applyFrames`, the pure reducer. Unchanged signals keep their `changedAt` so a fading highlight is not restarted, and signals absent from the current frame are retained so multiplexed cards do not flicker.
+- `src/lib/visualize-settings.ts` + `src/hooks/use-visualize-settings.ts` — highlight color, fade duration and threshold, persisted to `localStorage` (`can-tool:visualize-settings`). Nothing read back from storage is trusted: wrong types are ignored and numbers clamped.
+- `src/components/live-signal-value.tsx` — one signal row. The fade runs on the Web Animations API keyed on `changedAt`, keeping it off the React render path.
+- `src/components/live-message-card.tsx`, `visualize-settings-popover.tsx`, `live-traffic.tsx` — the card, the settings popover, and the view that folds frames into a ref and flushes to React at ~20 Hz. Note Base UI's `Slider` needs array values; a scalar makes it render two thumbs.
+- `src/routes/visualize.tsx` — thin route keeping the filter in the `q` search param.

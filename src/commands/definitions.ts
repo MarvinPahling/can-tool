@@ -20,6 +20,18 @@ export const COMMANDS = [
 		defaultBinding: ["G", "F"],
 	},
 	{
+		id: "view.dbc",
+		label: "DBC Browser",
+		description: "Show the parsed DBC message and signal table",
+		defaultBinding: "Mod+1",
+	},
+	{
+		id: "view.visualize",
+		label: "Live Traffic",
+		description: "Show incoming frames decoded into signal values",
+		defaultBinding: "Mod+2",
+	},
+	{
 		id: "app.showShortcuts",
 		label: "Keyboard Shortcuts…",
 		description: "Show all shortcuts and let you customize them",
