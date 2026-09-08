@@ -35,10 +35,12 @@ export function useConnectCanDevice() {
 		mutationFn: ({
 			portName,
 			bitrate,
+			readOnly,
 		}: {
 			portName: string;
 			bitrate: number;
-		}) => connectCanDevice(portName, bitrate),
+			readOnly: boolean;
+		}) => connectCanDevice(portName, bitrate, readOnly),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["can", "status"] });
 			queryClient.invalidateQueries({ queryKey: ["can", "devices"] });

@@ -37,8 +37,9 @@ export async function listCanDevices(): Promise<CanDeviceInfo[]> {
 export async function connectCanDevice(
 	portName: string,
 	bitrate: number,
+	readOnly: boolean,
 ): Promise<void> {
-	return connectCanDeviceCommand({ portName, bitrate });
+	return connectCanDeviceCommand({ portName, bitrate, readOnly });
 }
 
 export async function disconnectCanDevice(): Promise<void> {

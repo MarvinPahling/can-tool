@@ -120,6 +120,15 @@ export function SendMessageDialog() {
 							validate frames.
 						</AlertDescription>
 					</Alert>
+				) : status.data.read_only ? (
+					<Alert>
+						<AlertTitle>Connected in read-only mode</AlertTitle>
+						<AlertDescription>
+							The adapter is listening only and will not transmit. Reconnect
+							with read-only off to send. You can still compose and validate
+							frames.
+						</AlertDescription>
+					</Alert>
 				) : null}
 
 				{sendMessage.isError && (
@@ -169,7 +178,7 @@ export function SendMessageDialog() {
 												[id]: signalName,
 											}))
 										}
-										canSend={Boolean(status.data)}
+										canSend={Boolean(status.data) && !status.data?.read_only}
 										onSend={(message, values) =>
 											sendMessage.mutate({ message, values })
 										}

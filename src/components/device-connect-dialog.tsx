@@ -18,6 +18,8 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { useConnectSettings } from "@/hooks/use-connect-settings";
 import { cn } from "@/lib/utils";
 import {
 	useConnectCanDevice,
@@ -42,6 +44,9 @@ export function DeviceConnectDialog() {
 	const [open, setOpen] = useState(false);
 	const [selectedPort, setSelectedPort] = useState<string | null>(null);
 	const [bitrate, setBitrate] = useState(500_000);
+	// Persisted, unlike the port and bitrate: read-only is a property of the
+	// bus you are on, so it is almost always the same choice every session.
+	const { settings, setSettings } = useConnectSettings();
 
 	useCommandHandler("device.connect", () => setOpen(true));
 
@@ -81,7 +86,7 @@ export function DeviceConnectDialog() {
 						<AlertTitle>Connected</AlertTitle>
 						<AlertDescription>
 							{status.data.port_name} @ {status.data.bitrate.toLocaleString()}{" "}
-							bit/s
+							bit/s{status.data.read_only && " · read-only"}
 						</AlertDescription>
 					</Alert>
 				)}
@@ -144,6 +149,23 @@ export function DeviceConnectDialog() {
 					)}
 				</div>
 
+				{/* biome-ignore lint/a11y/noLabelWithoutControl: the Switch it wraps is the control, behind a component boundary biome cannot see through */}
+				<label className="flex items-start justify-between gap-3">
+					<span className="min-w-0">
+						<span className="block text-sm font-medium">Read-only mode</span>
+						<span className="block text-xs text-muted-foreground">
+							Receive only; the adapter will not transmit or ACK. Some adapters
+							stop receiving entirely in this mode.
+						</span>
+					</span>
+					<Switch
+						checked={settings.readOnly}
+						onCheckedChange={(checked: boolean) =>
+							setSettings({ readOnly: checked })
+						}
+					/>
+				</label>
+
 				<div className="flex items-center gap-2">
 					<Select
 						value={String(bitrate)}
@@ -178,7 +200,11 @@ export function DeviceConnectDialog() {
 						<Button
 							onClick={() =>
 								selectedPort &&
-								connect.mutate({ portName: selectedPort, bitrate })
+								connect.mutate({
+									portName: selectedPort,
+									bitrate,
+									readOnly: settings.readOnly,
+								})
 							}
 							disabled={!selectedPort || connect.isPending}
 						>

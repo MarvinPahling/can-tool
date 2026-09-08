@@ -30,6 +30,9 @@ pub struct CanDeviceInfo {
 pub struct CanConnectionStatus {
     pub port_name: String,
     pub bitrate: u32,
+    /// Opened in slcan listen-only mode: the adapter receives but never
+    /// transmits or ACKs, so every send path is refused.
+    pub read_only: bool,
 }
 
 struct CanConnection {
@@ -96,6 +99,27 @@ fn bitrate_code(bitrate: u32) -> Result<char, String> {
     }
 }
 
+/// slcan opens the channel with `O` (normal) or `L` (listen-only); in
+/// listen-only the adapter receives but never transmits or ACKs.
+fn open_command(read_only: bool) -> &'static str {
+    if read_only {
+        "L"
+    } else {
+        "O"
+    }
+}
+
+/// Refuses the transmit paths on a listen-only connection. The adapter would
+/// swallow the frame anyway, so failing loudly beats sending into a void.
+fn ensure_writable(status: &CanConnectionStatus) -> Result<(), String> {
+    if status.read_only {
+        return Err(
+            "Connected in read-only mode; reconnect with read-only off to send".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn write_slcan_command(port: &mut Box<dyn SerialPort>, command: &str) -> Result<(), String> {
     port.write_all(format!("{command}\r").as_bytes())
         .map_err(|e| e.to_string())?;
@@ -108,6 +132,7 @@ pub fn connect_can_device(
     state: State<CanState>,
     port_name: String,
     bitrate: u32,
+    read_only: bool,
 ) -> Result<(), String> {
     let code = bitrate_code(bitrate)?;
 
@@ -119,7 +144,7 @@ pub fn connect_can_device(
     // Ignore failures on "close if already open" — device may already be closed.
     let _ = write_slcan_command(&mut port, "C");
     write_slcan_command(&mut port, &format!("S{code}"))?;
-    write_slcan_command(&mut port, "O")?;
+    write_slcan_command(&mut port, open_command(read_only))?;
 
     // The reader gets its own handle so it never contends with the writer.
     let rx_port = port
@@ -140,7 +165,11 @@ pub fn connect_can_device(
     let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
     *guard = Some(CanConnection {
         port,
-        status: CanConnectionStatus { port_name, bitrate },
+        status: CanConnectionStatus {
+            port_name,
+            bitrate,
+            read_only,
+        },
         stop,
         reader: Some(reader),
     });
@@ -563,6 +592,7 @@ pub fn send_can_frame(
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
+    ensure_writable(&connection.status)?;
     write_frame(&mut connection.port, id, extended, &data)
 }
 
@@ -578,6 +608,7 @@ pub fn send_can_message(
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
+    ensure_writable(&connection.status)?;
     write_frame(&mut connection.port, message.id, message.extended, &data)
 }
 
@@ -613,6 +644,31 @@ mod tests {
             transmitter: None,
             signals,
         }
+    }
+
+    fn status(read_only: bool) -> CanConnectionStatus {
+        CanConnectionStatus {
+            port_name: "tty".to_string(),
+            bitrate: 500_000,
+            read_only,
+        }
+    }
+
+    #[test]
+    fn open_command_picks_listen_only_when_read_only() {
+        assert_eq!(open_command(false), "O");
+        assert_eq!(open_command(true), "L");
+    }
+
+    #[test]
+    fn ensure_writable_rejects_a_read_only_connection() {
+        assert!(ensure_writable(&status(false)).is_ok());
+
+        let error = ensure_writable(&status(true)).expect_err("read-only must reject writes");
+        assert!(
+            error.to_lowercase().contains("read-only"),
+            "the error should name read-only mode, got {error:?}"
+        );
     }
 
     #[test]
