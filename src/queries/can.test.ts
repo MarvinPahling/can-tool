@@ -25,6 +25,8 @@ vi.mock("@tauri-apps/api/event", () => ({ listen }));
 const frame: CanFrame = {
 	id: 0x1a0,
 	extended: false,
+	fd: false,
+	bitrate_switch: false,
 	data: [0xde, 0xad],
 	timestamp_ms: 1,
 };
@@ -81,6 +83,7 @@ describe("useCanFrames", () => {
 
 const progress: ProbeProgress = {
 	bitrate: 250_000,
+	data_bitrate: 2_000_000,
 	frames: 14,
 	done: false,
 	detected: null,

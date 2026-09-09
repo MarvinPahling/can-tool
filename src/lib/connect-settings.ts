@@ -6,13 +6,24 @@ export interface ConnectSettings {
 	/**
 	 * Open the adapter in slcan listen-only mode (`L` rather than `O`): it
 	 * receives frames but never transmits or ACKs. Off by default — a fair
-	 * number of adapters stop delivering frames entirely in this mode.
+	 * number of adapters stop delivering frames entirely in this mode, and the
+	 * CANable 2.0 firmware in particular stops delivering the full CAN FD
+	 * traffic.
 	 */
 	readOnly: boolean;
+	/**
+	 * The CAN FD data-phase bitrate (`Y2`/`Y5`), or `null` for classic CAN.
+	 * Like `readOnly` this is a property of the bus rather than of the session,
+	 * so it is worth remembering between runs.
+	 */
+	dataBitrate: number | null;
 }
 
 export const DEFAULT_CONNECT_SETTINGS: ConnectSettings = {
 	readOnly: false,
+	// The buses this tool is pointed at are CAN FD at 2 Mbit/s; a classic-CAN
+	// bus is a `null` away, and auto-detect overwrites this either way.
+	dataBitrate: 2_000_000,
 };
 
 /**
@@ -29,6 +40,9 @@ function merge(
 
 	if (typeof patch.readOnly === "boolean") {
 		next.readOnly = patch.readOnly;
+	}
+	if (patch.dataBitrate === null || typeof patch.dataBitrate === "number") {
+		next.dataBitrate = patch.dataBitrate;
 	}
 	return next;
 }

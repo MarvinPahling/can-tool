@@ -12,9 +12,17 @@ import type {
 	CanConnectionStatus,
 	CanDeviceInfo,
 	DbcMessage,
+	TimingCandidate,
 } from "../generated/types";
 
-export type { CanConnectionStatus, CanDeviceInfo };
+export type { CanConnectionStatus, CanDeviceInfo, TimingCandidate };
+
+/**
+ * The CAN FD data-phase bitrates the slcan `Y<n>` command can express, where
+ * the digit is the rate in Mbit/s. `null` is classic CAN, with no data phase at
+ * all. Kept in step with `data_bitrate_code` in `src-tauri/src/can.rs`.
+ */
+export const DATA_BITRATES = [null, 2_000_000, 5_000_000, 8_000_000] as const;
 
 /**
  * One CAN frame received from the bus, as carried by the `can-frames` event.
@@ -27,6 +35,10 @@ export type { CanConnectionStatus, CanDeviceInfo };
 export interface CanFrame {
 	id: number;
 	extended: boolean;
+	/** A CAN FD frame: up to 64 bytes of payload. */
+	fd: boolean;
+	/** CAN FD only: the data phase ran at the faster data bitrate. */
+	bitrate_switch: boolean;
 	data: number[];
 	timestamp_ms: number;
 }
@@ -43,11 +55,13 @@ export interface CanFrame {
  */
 export interface ProbeProgress {
 	bitrate: number;
+	/** The candidate's CAN FD data bitrate, or null for a classic candidate. */
+	data_bitrate: number | null;
 	frames: number;
 	/** True on the final update of a sweep, whatever the outcome. */
 	done: boolean;
-	/** Set only on the final update: the winning bitrate, or null if none. */
-	detected: number | null;
+	/** Set only on the final update: the winning timing, or null if none. */
+	detected: TimingCandidate | null;
 }
 
 export async function listCanDevices(): Promise<CanDeviceInfo[]> {
@@ -57,16 +71,29 @@ export async function listCanDevices(): Promise<CanDeviceInfo[]> {
 export async function connectCanDevice(
 	portName: string,
 	bitrate: number,
+	dataBitrate: number | null,
 	readOnly: boolean,
 ): Promise<void> {
-	return connectCanDeviceCommand({ portName, bitrate, readOnly });
+	// The generated schema models the Rust `Option<u32>` as an optional field,
+	// which rejects an explicit null — a classic-CAN channel has to omit the
+	// key instead.
+	return connectCanDeviceCommand({
+		portName,
+		bitrate,
+		dataBitrate: dataBitrate ?? undefined,
+		readOnly,
+	});
 }
 
-/** Sweeps the common bitrates on `portName`, returning the one that saw traffic. */
+/**
+ * Sweeps the common bus timings on `portName`, returning the one that saw the
+ * most convincing traffic — arbitration bitrate plus, on a CAN FD bus, the data
+ * bitrate. Null when nothing was heard at any of them.
+ */
 export async function autodetectBitrate(
 	portName: string,
 	readOnly: boolean,
-): Promise<number | null> {
+): Promise<TimingCandidate | null> {
 	return autodetectBitrateCommand({ portName, readOnly });
 }
 

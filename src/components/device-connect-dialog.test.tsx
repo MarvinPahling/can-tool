@@ -44,6 +44,9 @@ vi.mock("@/queries/can", () => ({
 	useProbeProgress,
 }));
 
+/** What a finished sweep resolves to; `data_bitrate` is absent on a classic bus. */
+type Detected = { bitrate: number; data_bitrate?: number };
+
 const device = {
 	port_name: "/dev/tty.usbmodem1",
 	manufacturer: "CANable",
@@ -96,6 +99,7 @@ describe("DeviceConnectDialog", () => {
 		expect(connectMutate).toHaveBeenCalledWith({
 			portName: device.port_name,
 			bitrate: 500_000,
+			dataBitrate: DEFAULT_CONNECT_SETTINGS.dataBitrate,
 			readOnly: false,
 		});
 	});
@@ -109,6 +113,7 @@ describe("DeviceConnectDialog", () => {
 		expect(connectMutate).toHaveBeenCalledWith({
 			portName: device.port_name,
 			bitrate: 500_000,
+			dataBitrate: DEFAULT_CONNECT_SETTINGS.dataBitrate,
 			readOnly: true,
 		});
 	});
@@ -130,12 +135,19 @@ describe("DeviceConnectDialog", () => {
 
 	it("says so in the status alert when connected read-only", async () => {
 		useConnectionStatus.mockReturnValue({
-			data: { port_name: device.port_name, bitrate: 500_000, read_only: true },
+			data: {
+				port_name: device.port_name,
+				bitrate: 500_000,
+				data_bitrate: undefined,
+				read_only: true,
+			},
 		});
 		await openDialog();
 
-		// Scoped to the alert: the toggle's own label also says "read-only".
-		const alert = screen.getByText(/500,000 bit\/s/);
+		// Scoped to the alert: the toggle's own label also says "read-only", and
+		// the bitrate select shows the same rate.
+		const alert = screen.getByRole("alert");
+		expect(alert.textContent).toMatch(/500 kbit\/s/);
 		expect(alert.textContent).toMatch(/read-only/i);
 		expect(screen.getByRole("button", { name: /disconnect/i })).toBeVisible();
 	});
@@ -149,8 +161,25 @@ describe("DeviceConnectDialog", () => {
 			runCommand("device.connect");
 		});
 
-		const alert = await screen.findByText(/500,000 bit\/s/);
+		const alert = await screen.findByRole("alert");
+		expect(alert.textContent).toMatch(/500 kbit\/s/);
 		expect(alert.textContent).not.toMatch(/read-only/i);
+	});
+
+	it("names the CAN FD data bitrate in the status alert", async () => {
+		useConnectionStatus.mockReturnValue({
+			data: {
+				port_name: device.port_name,
+				bitrate: 500_000,
+				data_bitrate: 2_000_000,
+				read_only: false,
+			},
+		});
+		await openDialog();
+
+		expect(screen.getByRole("alert").textContent).toMatch(
+			/500 kbit\/s \/ 2 Mbit\/s data/,
+		);
 	});
 
 	describe("auto-detecting the bitrate", () => {
@@ -183,6 +212,7 @@ describe("DeviceConnectDialog", () => {
 			await act(async () => {
 				emitProgress({
 					bitrate: 250_000,
+					data_bitrate: null,
 					frames: 14,
 					done: false,
 					detected: null,
@@ -193,15 +223,34 @@ describe("DeviceConnectDialog", () => {
 			expect(screen.getByText(/14 frames/)).toBeInTheDocument();
 		});
 
-		it("selects the detected bitrate and clears the progress line", async () => {
+		it("reports the FD data bitrate of the candidate being tried", async () => {
+			await openDialog();
+
+			await act(async () => {
+				emitProgress({
+					bitrate: 500_000,
+					data_bitrate: 2_000_000,
+					frames: 3,
+					done: false,
+					detected: null,
+				});
+			});
+
+			expect(
+				screen.getByText(/500 kbit\/s \/ 2 Mbit\/s data/),
+			).toBeInTheDocument();
+		});
+
+		it("selects the detected timing and clears the progress line", async () => {
 			autodetectMutate.mockImplementation(
-				(_vars: unknown, opts: { onSuccess?: (v: number | null) => void }) =>
-					opts.onSuccess?.(250_000),
+				(_vars: unknown, opts: { onSuccess?: (v: Detected) => void }) =>
+					opts.onSuccess?.({ bitrate: 250_000, data_bitrate: 5_000_000 }),
 			);
 			await openDialog();
 			await act(async () => {
 				emitProgress({
 					bitrate: 250_000,
+					data_bitrate: null,
 					frames: 14,
 					done: false,
 					detected: null,
@@ -212,8 +261,26 @@ describe("DeviceConnectDialog", () => {
 
 			expect(screen.queryByText(/14 frames/)).not.toBeInTheDocument();
 			await userEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+			// Both halves of the sweep's answer have to reach the connect call —
+			// the data bitrate is what makes an FD bus readable at all.
 			expect(connectMutate).toHaveBeenCalledWith(
-				expect.objectContaining({ bitrate: 250_000 }),
+				expect.objectContaining({ bitrate: 250_000, dataBitrate: 5_000_000 }),
+			);
+		});
+
+		it("falls back to classic CAN when the winning timing has no data phase", async () => {
+			autodetectMutate.mockImplementation(
+				(_vars: unknown, opts: { onSuccess?: (v: Detected) => void }) =>
+					// The backend omits the key entirely for a classic timing.
+					opts.onSuccess?.({ bitrate: 125_000 }),
+			);
+			await openDialog();
+
+			await userEvent.click(screen.getByRole("button", { name: /^auto$/i }));
+			await userEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+
+			expect(connectMutate).toHaveBeenCalledWith(
+				expect.objectContaining({ bitrate: 125_000, dataBitrate: null }),
 			);
 		});
 
@@ -233,7 +300,7 @@ describe("DeviceConnectDialog", () => {
 
 		it("keeps the failure on screen and leaves the bitrate alone", async () => {
 			autodetectMutate.mockImplementation(
-				(_vars: unknown, opts: { onSuccess?: (v: number | null) => void }) =>
+				(_vars: unknown, opts: { onSuccess?: (v: Detected | null) => void }) =>
 					opts.onSuccess?.(null),
 			);
 			await openDialog();

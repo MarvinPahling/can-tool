@@ -33,7 +33,21 @@ describe("connectSettingsStore", () => {
 	it("reads a stored setting back", () => {
 		localStorage.setItem(KEY, JSON.stringify({ readOnly: true }));
 
-		expect(loadConnectSettings()).toEqual({ readOnly: true });
+		expect(loadConnectSettings()).toEqual({
+			...DEFAULT_CONNECT_SETTINGS,
+			readOnly: true,
+		});
+	});
+
+	it("round-trips the CAN FD data bitrate, null included", () => {
+		setConnectSettings({ dataBitrate: 5_000_000 });
+		expect(stored().dataBitrate).toBe(5_000_000);
+
+		// Null is a real choice — classic CAN — not a missing value, so it has
+		// to survive the merge rather than fall back to the FD default.
+		setConnectSettings({ dataBitrate: null });
+		expect(connectSettingsStore.state.dataBitrate).toBeNull();
+		expect(loadConnectSettings().dataBitrate).toBeNull();
 	});
 
 	it("falls back to the defaults on corrupt JSON", () => {
@@ -43,7 +57,10 @@ describe("connectSettingsStore", () => {
 	});
 
 	it("ignores a stored value of the wrong type", () => {
-		localStorage.setItem(KEY, JSON.stringify({ readOnly: "yes" }));
+		localStorage.setItem(
+			KEY,
+			JSON.stringify({ readOnly: "yes", dataBitrate: "2M" }),
+		);
 
 		expect(loadConnectSettings()).toEqual(DEFAULT_CONNECT_SETTINGS);
 	});

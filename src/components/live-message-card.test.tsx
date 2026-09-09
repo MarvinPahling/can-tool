@@ -23,6 +23,8 @@ const known: LiveMessage = {
 	}),
 	id: 0x1a0,
 	extended: false,
+	fd: false,
+	bitrateSwitch: false,
 	data: [0x11, 0x22],
 	receivedAt: 1000,
 	count: 7,
@@ -62,10 +64,33 @@ describe("LiveMessageCard", () => {
 		expect(screen.getByText("7 frames")).toBeInTheDocument();
 	});
 
+	it("marks a CAN FD frame and its bit-rate switch", () => {
+		render(
+			<LiveMessageCard
+				live={{ ...known, fd: true, bitrateSwitch: true }}
+				settings={DEFAULT_VISUALIZE_SETTINGS}
+			/>,
+		);
+
+		expect(screen.getByText("FD")).toBeInTheDocument();
+		expect(screen.getByText("BRS")).toBeInTheDocument();
+	});
+
+	it("leaves the badges off a classic frame", () => {
+		render(
+			<LiveMessageCard live={known} settings={DEFAULT_VISUALIZE_SETTINGS} />,
+		);
+
+		expect(screen.queryByText("FD")).not.toBeInTheDocument();
+		expect(screen.queryByText("BRS")).not.toBeInTheDocument();
+	});
+
 	it("marks a frame whose id is not in the DBC", () => {
 		const unknown: LiveMessage = {
 			id: 0x999,
 			extended: true,
+			fd: false,
+			bitrateSwitch: false,
 			data: [0xde, 0xad],
 			receivedAt: 1000,
 			count: 1,

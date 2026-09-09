@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serialport::{SerialPort, SerialPortType};
+use serialport::{ClearBuffer, SerialPort, SerialPortType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
@@ -17,22 +17,71 @@ const CANABLE_PID: u16 = 0x60c4;
 
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Bitrates the auto-detect sweep tries, in descending order of how often they
-/// turn up in the wild rather than numeric order, so the usual answer is the
-/// first one tried.
-const PROBE_BITRATES: [u32; 9] = [
-    500_000, 250_000, 125_000, 1_000_000, 100_000, 800_000, 50_000, 20_000, 10_000,
+/// How long the adapter needs after the serial port is opened before it will
+/// answer commands. Opening the CDC-ACM device re-enumerates it, and anything
+/// written during that window is dropped — `S`/`Y`/`O` included, which leaves
+/// the channel closed and the app silent while the adapter answers with BEL.
+/// `python-can`'s slcan backend waits the same two seconds
+/// (`_SLEEP_AFTER_SERIAL_OPEN`).
+const POST_OPEN_SETTLE: Duration = Duration::from_secs(2);
+
+/// One bus timing: an arbitration bitrate, plus a CAN FD data-phase bitrate
+/// when the timing is an FD one.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+pub struct TimingCandidate {
+    pub bitrate: u32,
+    /// `None` for classic CAN.
+    pub data_bitrate: Option<u32>,
+}
+
+const fn fd_candidate(bitrate: u32, data_bitrate: u32) -> TimingCandidate {
+    TimingCandidate {
+        bitrate,
+        data_bitrate: Some(data_bitrate),
+    }
+}
+
+const fn classic_candidate(bitrate: u32) -> TimingCandidate {
+    TimingCandidate {
+        bitrate,
+        data_bitrate: None,
+    }
+}
+
+/// What the auto-detect sweep tries, ordered by how often each turns up in the
+/// wild rather than numerically. FD candidates come first: an FD bus is the
+/// harder case to recognize, and a classic candidate listening to one can
+/// half-decode its arbitration phase into a trickle of frames that would
+/// otherwise look like a match.
+const PROBE_CANDIDATES: [TimingCandidate; 8] = [
+    fd_candidate(500_000, 2_000_000),
+    fd_candidate(500_000, 5_000_000),
+    fd_candidate(1_000_000, 2_000_000),
+    fd_candidate(250_000, 2_000_000),
+    classic_candidate(500_000),
+    classic_candidate(250_000),
+    classic_candidate(125_000),
+    classic_candidate(1_000_000),
 ];
 
 /// A single frame can be garbage decoded at the wrong bitrate; two rarely are.
 const PROBE_MIN_FRAMES: usize = 2;
 
-/// How long to listen at each candidate bitrate before moving on.
-const PROBE_DWELL: Duration = Duration::from_millis(400);
+/// How long to listen at each candidate timing before moving on.
+const PROBE_DWELL: Duration = Duration::from_millis(1000);
 
 /// Shorter than `SERIAL_TIMEOUT`, so one blocking read cannot overrun the dwell
 /// and stall the progress the UI is rendering.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Ranking weights for a swept candidate, mirroring `ScoreWeights` in the
+/// reference tool's `models.py`. FD and BRS frames are worth more than plain
+/// ones so that a real FD bus outranks the classic candidate that partially
+/// decodes it; adapter rejections count against a candidate.
+const SCORE_FRAME: i64 = 1;
+const SCORE_FD: i64 = 4;
+const SCORE_BRS: i64 = 2;
+const SCORE_REJECTION: i64 = -3;
 
 #[derive(Serialize)]
 pub struct CanDeviceInfo {
@@ -47,21 +96,25 @@ pub struct CanDeviceInfo {
 pub struct CanConnectionStatus {
     pub port_name: String,
     pub bitrate: u32,
+    /// The CAN FD data-phase bitrate, or `None` when the channel is classic
+    /// CAN. Also decides how frames are transmitted; see `tx_format`.
+    pub data_bitrate: Option<u32>,
     /// Opened in slcan listen-only mode: the adapter receives but never
     /// transmits or ACKs, so every send path is refused.
     pub read_only: bool,
 }
 
-/// One `can-probe` event: the bitrate being tried and what it has seen so far.
+/// One `can-probe` event: the timing being tried and what it has seen so far.
 #[derive(Serialize, Clone)]
 pub struct ProbeProgress {
     pub bitrate: u32,
+    pub data_bitrate: Option<u32>,
     pub frames: usize,
     /// True on the final event of a sweep, whatever the outcome.
     pub done: bool,
-    /// Set only on the final event: the winning bitrate, or `None` if the sweep
+    /// Set only on the final event: the winning timing, or `None` if the sweep
     /// found nothing.
-    pub detected: Option<u32>,
+    pub detected: Option<TimingCandidate>,
 }
 
 struct CanConnection {
@@ -136,20 +189,43 @@ pub fn list_can_devices() -> Result<Vec<CanDeviceInfo>, String> {
         .collect())
 }
 
-/// Maps a bitrate to its slcan `S<n>` setup code.
-/// See https://www.can232.com/docs/canusb_manual.pdf for the standard table.
+/// Maps an arbitration bitrate to its slcan `S<n>` setup code.
+///
+/// The table follows the CANable firmware as `python-can` documents it
+/// (`slcanBus._BITRATES`), which is what the reference tool talks to. Note `S7`
+/// is 750 kbit/s there, not the 800 kbit/s of the original LAWICEL table.
 fn bitrate_code(bitrate: u32) -> Result<char, String> {
     match bitrate {
         10_000 => Ok('0'),
         20_000 => Ok('1'),
         50_000 => Ok('2'),
+        83_300 => Ok('9'),
         100_000 => Ok('3'),
         125_000 => Ok('4'),
         250_000 => Ok('5'),
         500_000 => Ok('6'),
-        800_000 => Ok('7'),
+        750_000 => Ok('7'),
         1_000_000 => Ok('8'),
         other => Err(format!("Unsupported bitrate: {other}")),
+    }
+}
+
+/// Maps a CAN FD data-phase bitrate to its slcan `Y<n>` setup code, or `None`
+/// for a classic CAN channel. The digit is the rate in Mbit/s.
+///
+/// `python-can`'s `slcanBus._DATA_BITRATES` knows only `Y2` and `Y5`, so those
+/// two are the ones the reference tool has actually exercised. `Y8` follows the
+/// same encoding but is unverified against the firmware — if the adapter does
+/// not support it, it answers the command with BEL and the channel stays shut.
+fn data_bitrate_code(data_bitrate: Option<u32>) -> Result<Option<&'static str>, String> {
+    match data_bitrate {
+        None => Ok(None),
+        Some(2_000_000) => Ok(Some("Y2")),
+        Some(5_000_000) => Ok(Some("Y5")),
+        Some(8_000_000) => Ok(Some("Y8")),
+        Some(other) => Err(format!(
+            "Unsupported CAN FD data bitrate: {other} (supported: 2000000, 5000000, 8000000)"
+        )),
     }
 }
 
@@ -163,9 +239,20 @@ fn open_command(read_only: bool) -> &'static str {
     }
 }
 
-/// Whether a candidate bitrate saw enough traffic to call it the right one.
+/// Whether a candidate saw enough traffic to call it the right timing.
 fn probe_hit(frames: usize) -> bool {
     frames >= PROBE_MIN_FRAMES
+}
+
+/// How a frame should be transmitted on the current channel.
+///
+/// A channel configured with a data bitrate is an FD channel, and on such a bus
+/// every frame — including the eight-byte ones — is FD with bit-rate switch, so
+/// that is what we send. Mirrors the reference tool, which derives `is_fd` and
+/// `bitrate_switch` from the timing candidate rather than the payload length.
+fn tx_format(status: &CanConnectionStatus) -> (bool, bool) {
+    let fd = status.data_bitrate.is_some();
+    (fd, fd)
 }
 
 /// Refuses the transmit paths on a listen-only connection. The adapter would
@@ -185,26 +272,45 @@ fn write_slcan_command(port: &mut Box<dyn SerialPort>, command: &str) -> Result<
     port.flush().map_err(|e| e.to_string())
 }
 
+/// Closes the slcan channel, sets the timing and reopens it — the sequence
+/// `python-can` performs in `set_bitrate`, and the only place the `S`/`Y`/`O`
+/// commands are written. Shared by the connect path and every step of a sweep,
+/// so the two cannot drift apart and forget the data bitrate.
+fn configure_channel(
+    port: &mut Box<dyn SerialPort>,
+    candidate: TimingCandidate,
+    read_only: bool,
+) -> Result<(), String> {
+    // Both codes are resolved before anything is written, so an unsupported
+    // rate cannot leave the channel closed halfway through.
+    let code = bitrate_code(candidate.bitrate)?;
+    let data_code = data_bitrate_code(candidate.data_bitrate)?;
+
+    // Ignore failures on "close if already open" — the channel may already be closed.
+    let _ = write_slcan_command(port, "C");
+    write_slcan_command(port, &format!("S{code}"))?;
+    if let Some(data_code) = data_code {
+        write_slcan_command(port, data_code)?;
+    }
+    write_slcan_command(port, open_command(read_only))
+}
+
 /// Opens the port, configures the slcan channel and starts the reader thread.
 /// Shared by `connect_can_device` and the reconnect at the end of a bitrate
 /// sweep, so the two paths cannot drift apart.
 fn open_connection(
     app: AppHandle,
     port_name: &str,
-    bitrate: u32,
+    candidate: TimingCandidate,
     read_only: bool,
 ) -> Result<CanConnection, String> {
-    let code = bitrate_code(bitrate)?;
-
     let mut port = serialport::new(port_name, 115_200)
         .timeout(SERIAL_TIMEOUT)
         .open()
         .map_err(|e| format!("Failed to open {port_name}: {e}"))?;
 
-    // Ignore failures on "close if already open" — device may already be closed.
-    let _ = write_slcan_command(&mut port, "C");
-    write_slcan_command(&mut port, &format!("S{code}"))?;
-    write_slcan_command(&mut port, open_command(read_only))?;
+    thread::sleep(POST_OPEN_SETTLE);
+    configure_channel(&mut port, candidate, read_only)?;
 
     // The reader gets its own handle so it never contends with the writer.
     let rx_port = port
@@ -217,7 +323,8 @@ fn open_connection(
         port,
         status: CanConnectionStatus {
             port_name: port_name.to_string(),
-            bitrate,
+            bitrate: candidate.bitrate,
+            data_bitrate: candidate.data_bitrate,
             read_only,
         },
         stop,
@@ -231,6 +338,7 @@ pub fn connect_can_device(
     state: State<CanState>,
     port_name: String,
     bitrate: u32,
+    data_bitrate: Option<u32>,
     read_only: bool,
 ) -> Result<(), String> {
     // Racy by nature — the sweep could claim the flag right after this check —
@@ -240,7 +348,11 @@ pub fn connect_can_device(
         return Err("A bitrate sweep is running; wait for it to finish".to_string());
     }
 
-    let connection = open_connection(app, &port_name, bitrate, read_only)?;
+    let candidate = TimingCandidate {
+        bitrate,
+        data_bitrate,
+    };
+    let connection = open_connection(app, &port_name, candidate, read_only)?;
 
     let mut guard = state
         .connection
@@ -256,24 +368,65 @@ pub fn connect_can_device(
     Ok(())
 }
 
-/// Listens at one candidate bitrate and reports how many valid frames arrived.
-/// Opens its own short-lived handle: the sweep runs with no connection in
-/// `CanState`, so there is no reader thread to share with.
-fn probe_bitrate(port_name: &str, bitrate: u32, read_only: bool) -> Result<usize, String> {
-    let code = bitrate_code(bitrate)?;
+/// What one candidate's dwell heard, and how it ranks against the others.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct ProbeTally {
+    frames: usize,
+    fd: usize,
+    brs: usize,
+    rejections: usize,
+}
 
-    let mut port = serialport::new(port_name, 115_200)
-        .timeout(PROBE_READ_TIMEOUT)
-        .open()
-        .map_err(|e| format!("Failed to open {port_name}: {e}"))?;
+impl ProbeTally {
+    fn observe(&mut self, batch: &RxBatch) {
+        self.rejections += batch.rejections;
+        for frame in &batch.frames {
+            self.frames += 1;
+            if frame.fd {
+                self.fd += 1;
+            }
+            if frame.bitrate_switch {
+                self.brs += 1;
+            }
+        }
+    }
 
-    let _ = write_slcan_command(&mut port, "C");
-    write_slcan_command(&mut port, &format!("S{code}"))?;
-    write_slcan_command(&mut port, open_command(read_only))?;
+    fn score(&self) -> i64 {
+        self.frames as i64 * SCORE_FRAME
+            + self.fd as i64 * SCORE_FD
+            + self.brs as i64 * SCORE_BRS
+            + self.rejections as i64 * SCORE_REJECTION
+    }
+
+    /// Highest wins; frame count breaks a tie in score.
+    fn rank_key(&self) -> (i64, usize) {
+        (self.score(), self.frames)
+    }
+
+    fn usable(&self) -> bool {
+        probe_hit(self.frames)
+    }
+}
+
+/// Listens at one candidate timing on an already-open port and reports what it
+/// heard.
+///
+/// Reconfiguring the open handle rather than reopening it per candidate is both
+/// what `python-can` does in `set_bitrate` and what keeps a sweep down to a few
+/// seconds: `POST_OPEN_SETTLE` would otherwise be paid once per candidate.
+fn probe_candidate(
+    port: &mut Box<dyn SerialPort>,
+    port_name: &str,
+    candidate: TimingCandidate,
+    read_only: bool,
+) -> Result<ProbeTally, String> {
+    configure_channel(port, candidate, read_only)?;
+    // Whatever the previous candidate left in flight is noise at this timing.
+    let _ = port.clear(ClearBuffer::Input);
 
     let mut raw = [0u8; 1024];
     let mut buf = String::new();
-    let mut frames = 0usize;
+    let mut tally = ProbeTally::default();
     let deadline = Instant::now() + PROBE_DWELL;
 
     while Instant::now() < deadline {
@@ -282,9 +435,7 @@ fn probe_bitrate(port_name: &str, bitrate: u32, read_only: bool) -> Result<usize
             Ok(0) => thread::sleep(Duration::from_millis(1)),
             Ok(n) => {
                 buf.push_str(&String::from_utf8_lossy(&raw[..n]));
-                // Rejections are ignored: at the wrong bitrate the adapter
-                // produces plenty of them, and they are not evidence either way.
-                frames += drain_lines(&mut buf, now_ms()).frames.len();
+                tally.observe(&drain_lines(&mut buf, now_ms()));
             }
             // Timeouts are how a silent bus looks — keep listening.
             Err(e) if e.kind() == ErrorKind::TimedOut => {}
@@ -292,8 +443,42 @@ fn probe_bitrate(port_name: &str, bitrate: u32, read_only: bool) -> Result<usize
         }
     }
 
-    let _ = write_slcan_command(&mut port, "C");
-    Ok(frames)
+    let _ = write_slcan_command(port, "C");
+    Ok(tally)
+}
+
+/// Picks the winner of a finished sweep: the highest-scoring candidate that
+/// heard enough to count.
+///
+/// Iterates in reverse because `max_by_key` keeps the *last* maximum, and on a
+/// tie the earlier candidate should win — that is what makes the FD-first
+/// ordering of `PROBE_CANDIDATES` mean anything.
+fn best_candidate(ranked: &[(TimingCandidate, ProbeTally)]) -> Option<TimingCandidate> {
+    ranked
+        .iter()
+        .rev()
+        .filter(|(_, tally)| tally.usable())
+        .max_by_key(|(_, tally)| tally.rank_key())
+        .map(|(candidate, _)| *candidate)
+}
+
+fn emit_probe(
+    app: &AppHandle,
+    candidate: TimingCandidate,
+    frames: usize,
+    done: bool,
+    detected: Option<TimingCandidate>,
+) {
+    let _ = app.emit(
+        "can-probe",
+        ProbeProgress {
+            bitrate: candidate.bitrate,
+            data_bitrate: candidate.data_bitrate,
+            frames,
+            done,
+            detected,
+        },
+    );
 }
 
 /// The sweep itself, run on a blocking worker rather than the main thread.
@@ -303,12 +488,16 @@ fn probe_bitrate(port_name: &str, bitrate: u32, read_only: bool) -> Result<usize
 /// whole sweep would block `can_connection_status`, which the UI polls every
 /// second from the main thread, and that is exactly what froze the app.
 /// Overlapping sweeps and connects are kept apart by the probing flag instead.
+///
+/// Every candidate is tried, not just the first hit: a classic timing can
+/// half-decode an FD bus into a handful of frames, so the sweep has to see the
+/// whole field before it can rank them.
 fn run_bitrate_sweep(
     app: &AppHandle,
     state: &CanState,
     port_name: &str,
     read_only: bool,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<TimingCandidate>, String> {
     let _probing = ProbeGuard::claim(state)?;
 
     // The OS will not grant a second exclusive open, so a live connection has
@@ -323,52 +512,39 @@ fn run_bitrate_sweep(
         let _ = write_slcan_command(&mut previous.port, "C");
     }
 
-    let mut detected = None;
-    let mut last = (0u32, 0usize);
+    let mut port = serialport::new(port_name, 115_200)
+        .timeout(PROBE_READ_TIMEOUT)
+        .open()
+        .map_err(|e| format!("Failed to open {port_name}: {e}"))?;
+    thread::sleep(POST_OPEN_SETTLE);
 
-    for bitrate in PROBE_BITRATES {
-        let _ = app.emit(
-            "can-probe",
-            ProbeProgress {
-                bitrate,
-                frames: 0,
-                done: false,
-                detected: None,
-            },
-        );
+    let mut ranked: Vec<(TimingCandidate, ProbeTally)> = Vec::with_capacity(PROBE_CANDIDATES.len());
 
-        let frames = probe_bitrate(port_name, bitrate, read_only)?;
-        last = (bitrate, frames);
-
-        let _ = app.emit(
-            "can-probe",
-            ProbeProgress {
-                bitrate,
-                frames,
-                done: false,
-                detected: None,
-            },
-        );
-
-        if probe_hit(frames) {
-            detected = Some(bitrate);
-            break;
-        }
+    for candidate in PROBE_CANDIDATES {
+        emit_probe(app, candidate, 0, false, None);
+        let tally = probe_candidate(&mut port, port_name, candidate, read_only)?;
+        emit_probe(app, candidate, tally.frames, false, None);
+        ranked.push((candidate, tally));
     }
 
-    let _ = app.emit(
-        "can-probe",
-        ProbeProgress {
-            bitrate: last.0,
-            frames: last.1,
-            done: true,
-            detected,
-        },
-    );
+    // The reconnect below needs the port, and the OS will not grant a second
+    // exclusive open while this handle is alive.
+    let _ = write_slcan_command(&mut port, "C");
+    drop(port);
+
+    let detected = best_candidate(&ranked);
+    // The closing event reports the winner, or the last candidate tried when
+    // nothing won, so the UI always has something concrete to name.
+    let (reported, tally) = detected
+        .and_then(|winner| ranked.iter().find(|(candidate, _)| *candidate == winner))
+        .or_else(|| ranked.last())
+        .copied()
+        .unwrap_or((PROBE_CANDIDATES[0], ProbeTally::default()));
+    emit_probe(app, reported, tally.frames, true, detected);
 
     // Leave the user connected at what the sweep found.
-    if let Some(bitrate) = detected {
-        let connection = open_connection(app.clone(), port_name, bitrate, read_only)?;
+    if let Some(candidate) = detected {
+        let connection = open_connection(app.clone(), port_name, candidate, read_only)?;
         *state
             .connection
             .lock()
@@ -383,10 +559,10 @@ pub async fn autodetect_bitrate(
     app: AppHandle,
     port_name: String,
     read_only: bool,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<TimingCandidate>, String> {
     // Sync Tauri commands run on the main thread, so a multi-second sweep there
     // freezes the webview. `spawn_blocking` moves it off, and the awaited
-    // handle still resolves the invoke with the detected bitrate.
+    // handle still resolves the invoke with the detected timing.
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<CanState>();
         run_bitrate_sweep(&app, &state, &port_name, read_only)
@@ -583,6 +759,10 @@ pub fn generate_checksum(
 pub struct CanFrame {
     pub id: u32,
     pub extended: bool,
+    /// A CAN FD frame: up to 64 bytes, and a DLC that indexes `CAN_FD_DLC`.
+    pub fd: bool,
+    /// CAN FD only: the data phase ran at the faster data bitrate.
+    pub bitrate_switch: bool,
     pub data: Vec<u8>,
     pub timestamp_ms: u64,
 }
@@ -591,23 +771,79 @@ pub struct CanFrame {
 const MAX_STANDARD_ID: u32 = 0x7FF;
 const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
 
+/// The payload lengths CAN FD can express, indexed by DLC nibble. Above eight
+/// bytes the steps are coarse, which is why a payload has to be padded up to
+/// the next one rather than sent at its own length.
+const CAN_FD_DLC: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
+
+/// The DLC nibble and padded byte count CAN FD uses to carry `len` bytes, or
+/// `None` if the payload is larger than a CAN FD frame.
+fn fd_dlc_for(len: usize) -> Option<(usize, usize)> {
+    CAN_FD_DLC
+        .iter()
+        .position(|&size| size >= len)
+        .map(|code| (code, CAN_FD_DLC[code]))
+}
+
 /// Formats a frame as an slcan/LAWICEL transmit command (without the trailing
 /// `\r`, which `write_slcan_command` appends).
-fn format_slcan_frame(id: u32, extended: bool, data: &[u8]) -> String {
-    let hex_data: String = data.iter().map(|b| format!("{b:02X}")).collect();
-    if extended {
-        format!("T{id:08X}{}{hex_data}", data.len())
+///
+/// Classic frames are `t`/`T`; CAN FD is `d`/`D`, and `b`/`B` when the data
+/// phase switches bitrate. An FD payload is zero-padded up to the next
+/// expressible length, because CAN FD has no arbitrary sizes above eight bytes.
+fn format_slcan_frame(
+    id: u32,
+    extended: bool,
+    fd: bool,
+    bitrate_switch: bool,
+    data: &[u8],
+) -> Result<String, String> {
+    let kind = match (fd, bitrate_switch, extended) {
+        (false, _, false) => 't',
+        (false, _, true) => 'T',
+        (true, false, false) => 'd',
+        (true, false, true) => 'D',
+        (true, true, false) => 'b',
+        (true, true, true) => 'B',
+    };
+
+    let (dlc, padded) = if fd {
+        fd_dlc_for(data.len()).ok_or_else(|| {
+            format!(
+                "CAN FD frames support at most 64 data bytes, got {}",
+                data.len()
+            )
+        })?
     } else {
-        format!("t{id:03X}{}{hex_data}", data.len())
+        if data.len() > 8 {
+            return Err(format!(
+                "Classic CAN frames support at most 8 data bytes, got {}",
+                data.len()
+            ));
+        }
+        (data.len(), data.len())
+    };
+
+    let mut hex = String::with_capacity(padded * 2);
+    for i in 0..padded {
+        hex.push_str(&format!("{:02X}", data.get(i).copied().unwrap_or(0)));
     }
+
+    Ok(if extended {
+        format!("{kind}{id:08X}{dlc:X}{hex}")
+    } else {
+        format!("{kind}{id:03X}{dlc:X}{hex}")
+    })
 }
 
 /// Parses a single slcan line into a frame — the inverse of
 /// `format_slcan_frame`, and the entry point for everything arriving from the
 /// bus.
 ///
-/// `t<3-hex-id><len><hexdata>` and `T<8-hex-id><len><hexdata>` are data
-/// frames; `r`/`R` are their remote-request counterparts and carry no payload.
+/// `t<3-hex-id><len><hexdata>` and `T<8-hex-id><len><hexdata>` are classic data
+/// frames; `r`/`R` are their remote-request counterparts and carry no payload;
+/// `d`/`D` are CAN FD and `b`/`B` CAN FD with bit-rate switch, whose length
+/// field is a DLC nibble indexing `CAN_FD_DLC` rather than a byte count.
 /// Anything else the adapter may send — a bare `\r`, the BEL byte it uses to
 /// reject a transmitted frame, a `V1010` version reply, truncated or non-hex
 /// digits, or a DLC that disagrees with the payload — is not a frame and
@@ -622,11 +858,15 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
     }
 
     let (kind, rest) = line.split_at_checked(1)?;
-    let (extended, remote) = match kind {
-        "t" => (false, false),
-        "T" => (true, false),
-        "r" => (false, true),
-        "R" => (true, true),
+    let (extended, remote, fd, bitrate_switch) = match kind {
+        "t" => (false, false, false, false),
+        "T" => (true, false, false, false),
+        "r" => (false, true, false, false),
+        "R" => (true, true, false, false),
+        "d" => (false, false, true, false),
+        "D" => (true, false, true, false),
+        "b" => (false, false, true, true),
+        "B" => (true, false, true, true),
         _ => return None,
     };
 
@@ -642,10 +882,16 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
     }
 
     let (len_hex, payload) = rest.split_at_checked(1)?;
-    let len = parse_hex(len_hex)? as usize;
-    if len > 8 {
-        return None;
-    }
+    let code = parse_hex(len_hex)? as usize;
+    let len = if fd {
+        // A single hex digit always indexes the table, so this cannot fail.
+        *CAN_FD_DLC.get(code)?
+    } else {
+        if code > 8 {
+            return None;
+        }
+        code
+    };
 
     // A remote frame declares a length but carries no bytes.
     let data = if remote {
@@ -667,6 +913,8 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
     Some(CanFrame {
         id,
         extended,
+        fd,
+        bitrate_switch,
         data,
         timestamp_ms: 0,
     })
@@ -787,16 +1035,18 @@ fn write_frame(
     port: &mut Box<dyn SerialPort>,
     id: u32,
     extended: bool,
+    fd: bool,
+    bitrate_switch: bool,
     data: &[u8],
 ) -> Result<(), String> {
-    if data.len() > 8 {
-        return Err("CAN frames support at most 8 data bytes".to_string());
-    }
     // The ack (`\r` success, BEL 0x07 rejection) is deliberately not read
     // here: the reader thread owns the incoming byte stream, and racing it
     // for that byte would corrupt both sides. It surfaces a rejection as a
     // `can-error` event instead, so this returns as soon as the write lands.
-    write_slcan_command(port, &format_slcan_frame(id, extended, data))
+    write_slcan_command(
+        port,
+        &format_slcan_frame(id, extended, fd, bitrate_switch, data)?,
+    )
 }
 
 #[tauri::command]
@@ -812,7 +1062,8 @@ pub fn send_can_frame(
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
     ensure_writable(&connection.status)?;
-    write_frame(&mut connection.port, id, extended, &data)
+    let (fd, brs) = tx_format(&connection.status);
+    write_frame(&mut connection.port, id, extended, fd, brs, &data)
 }
 
 #[tauri::command]
@@ -828,7 +1079,15 @@ pub fn send_can_message(
         .map_err(|_| "CAN state poisoned".to_string())?;
     let connection = guard.as_mut().ok_or("No CAN device connected")?;
     ensure_writable(&connection.status)?;
-    write_frame(&mut connection.port, message.id, message.extended, &data)
+    let (fd, brs) = tx_format(&connection.status);
+    write_frame(
+        &mut connection.port,
+        message.id,
+        message.extended,
+        fd,
+        brs,
+        &data,
+    )
 }
 
 #[cfg(test)]
@@ -869,7 +1128,17 @@ mod tests {
         CanConnectionStatus {
             port_name: "tty".to_string(),
             bitrate: 500_000,
+            data_bitrate: None,
             read_only,
+        }
+    }
+
+    fn tally(frames: usize, fd: usize, brs: usize, rejections: usize) -> ProbeTally {
+        ProbeTally {
+            frames,
+            fd,
+            brs,
+            rejections,
         }
     }
 
@@ -902,18 +1171,107 @@ mod tests {
     }
 
     #[test]
-    fn every_probed_bitrate_has_an_slcan_code() {
-        for bitrate in PROBE_BITRATES {
+    fn every_probed_candidate_has_slcan_codes() {
+        for candidate in PROBE_CANDIDATES {
             assert!(
-                bitrate_code(bitrate).is_ok(),
-                "{bitrate} is probed but has no slcan code"
+                bitrate_code(candidate.bitrate).is_ok(),
+                "{} is probed but has no slcan code",
+                candidate.bitrate
+            );
+            assert!(
+                data_bitrate_code(candidate.data_bitrate).is_ok(),
+                "{:?} is probed but has no slcan data-bitrate code",
+                candidate.data_bitrate
             );
         }
     }
 
     #[test]
-    fn probe_tries_the_common_bitrates_first() {
-        assert_eq!(&PROBE_BITRATES[..3], &[500_000, 250_000, 125_000]);
+    fn probe_tries_fd_candidates_before_classic_ones() {
+        // A classic candidate can half-decode an FD bus, so the FD timings have
+        // to be in the field before ranking can prefer them.
+        let first_classic = PROBE_CANDIDATES
+            .iter()
+            .position(|candidate| candidate.data_bitrate.is_none())
+            .expect("the sweep must still try classic CAN");
+        assert!(
+            PROBE_CANDIDATES[..first_classic]
+                .iter()
+                .all(|candidate| candidate.data_bitrate.is_some()),
+            "FD candidates must come first"
+        );
+        assert_eq!(PROBE_CANDIDATES[0], fd_candidate(500_000, 2_000_000));
+    }
+
+    #[test]
+    fn data_bitrate_code_matches_the_canable_firmware() {
+        assert_eq!(data_bitrate_code(None), Ok(None));
+        assert_eq!(data_bitrate_code(Some(2_000_000)), Ok(Some("Y2")));
+        assert_eq!(data_bitrate_code(Some(5_000_000)), Ok(Some("Y5")));
+        assert_eq!(data_bitrate_code(Some(8_000_000)), Ok(Some("Y8")));
+        // Rates with no `Y` code are refused here rather than written blindly.
+        assert!(data_bitrate_code(Some(1_000_000)).is_err());
+        assert!(data_bitrate_code(Some(4_000_000)).is_err());
+    }
+
+    #[test]
+    fn an_fd_candidate_outranks_a_busier_classic_one() {
+        // The failure this guards: 500k classic listening to a 500k/2M FD bus
+        // picks up a trickle of arbitration-phase frames, and a first-hit or
+        // frame-count-only sweep would settle on it.
+        let ranked = vec![
+            (fd_candidate(500_000, 2_000_000), tally(10, 10, 10, 0)),
+            (classic_candidate(500_000), tally(20, 0, 0, 0)),
+        ];
+        assert_eq!(
+            best_candidate(&ranked),
+            Some(fd_candidate(500_000, 2_000_000))
+        );
+    }
+
+    #[test]
+    fn ranking_ignores_candidates_that_heard_too_little() {
+        let ranked = vec![
+            (fd_candidate(500_000, 2_000_000), tally(1, 1, 1, 0)),
+            (classic_candidate(250_000), tally(5, 0, 0, 0)),
+        ];
+        assert_eq!(best_candidate(&ranked), Some(classic_candidate(250_000)));
+    }
+
+    #[test]
+    fn ranking_finds_nothing_on_a_silent_bus() {
+        let ranked = vec![
+            (fd_candidate(500_000, 2_000_000), tally(0, 0, 0, 4)),
+            (classic_candidate(500_000), tally(0, 0, 0, 7)),
+        ];
+        assert_eq!(best_candidate(&ranked), None);
+    }
+
+    #[test]
+    fn ranking_breaks_a_tie_towards_the_earlier_candidate() {
+        let ranked = vec![
+            (fd_candidate(500_000, 2_000_000), tally(4, 4, 4, 0)),
+            (fd_candidate(500_000, 5_000_000), tally(4, 4, 4, 0)),
+        ];
+        assert_eq!(
+            best_candidate(&ranked),
+            Some(fd_candidate(500_000, 2_000_000)),
+            "PROBE_CANDIDATES is ordered by likelihood; a tie must respect it"
+        );
+    }
+
+    #[test]
+    fn rejections_count_against_a_candidate() {
+        assert!(tally(5, 0, 0, 0).score() > tally(5, 0, 0, 3).score());
+    }
+
+    #[test]
+    fn probe_tally_counts_fd_and_brs_frames() {
+        let mut buf = String::from("b0A0A20E0020000000A990000000000000000\rt1A01FF\r\u{7}");
+        let mut probed = ProbeTally::default();
+        probed.observe(&drain_lines(&mut buf, 0));
+
+        assert_eq!(probed, tally(2, 1, 1, 1));
     }
 
     #[test]
@@ -937,11 +1295,28 @@ mod tests {
     fn bitrate_code_maps_known_bitrates() {
         assert_eq!(bitrate_code(500_000), Ok('6'));
         assert_eq!(bitrate_code(1_000_000), Ok('8'));
+        // The CANable firmware's S7 is 750 kbit/s, not the LAWICEL table's 800.
+        assert_eq!(bitrate_code(750_000), Ok('7'));
+        assert_eq!(bitrate_code(83_300), Ok('9'));
     }
 
     #[test]
     fn bitrate_code_rejects_unknown_bitrates() {
         assert!(bitrate_code(123_456).is_err());
+        // Would silently have configured 750 kbit/s before.
+        assert!(bitrate_code(800_000).is_err());
+    }
+
+    #[test]
+    fn tx_format_follows_the_channel_not_the_payload() {
+        // Classic channel: plain frames.
+        assert_eq!(tx_format(&status(false)), (false, false));
+
+        // FD channel: every frame goes out FD with bit-rate switch, including
+        // the eight-byte ones — that is what the ECUs on such a bus send.
+        let mut fd_status = status(false);
+        fd_status.data_bitrate = Some(2_000_000);
+        assert_eq!(tx_format(&fd_status), (true, true));
     }
 
     #[test]
@@ -1163,22 +1538,114 @@ mod tests {
 
     #[test]
     fn slcan_frames_round_trip_through_format_and_parse() {
-        for (id, extended, data) in [
-            (0x1A0u32, false, vec![0xDE, 0xAD]),
-            (0x7FF, false, vec![]),
+        for (id, extended, fd, brs, data) in [
+            (0x1A0u32, false, false, false, vec![0xDE, 0xAD]),
+            (0x7FF, false, false, false, vec![]),
             (
                 0x18DAF110,
                 true,
+                false,
+                false,
                 vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
             ),
+            // CAN FD, with and without the bit-rate switch, at a length only FD
+            // can express.
+            (0x0A5, false, true, true, (0..16u8).collect()),
+            (0x272, false, true, true, vec![0x00; 8]),
+            (0x30B, false, true, false, vec![0xAA; 12]),
+            (0x18DAF110, true, true, true, vec![0xFF; 64]),
         ] {
-            let line = format_slcan_frame(id, extended, &data);
+            let line = format_slcan_frame(id, extended, fd, brs, &data)
+                .unwrap_or_else(|e| panic!("failed to format {id:X}: {e}"));
             let frame =
                 parse_slcan_frame(&line).unwrap_or_else(|| panic!("failed to parse {line:?}"));
             assert_eq!(frame.id, id);
             assert_eq!(frame.extended, extended);
+            assert_eq!(frame.fd, fd);
+            assert_eq!(frame.bitrate_switch, brs);
             assert_eq!(frame.data, data);
         }
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_the_fd_frames_this_bus_actually_carries() {
+        // Straight off `ignore/canable/captures/capture-20260827-160000.csv`:
+        // 0xA5 is FD+BRS with a 16-byte payload (DLC nibble A), which the
+        // classic-only parser dropped on the floor.
+        let frame = parse_slcan_frame("b0A5A20E0020000000A990000000000000000").unwrap();
+        assert_eq!(frame.id, 0xA5);
+        assert!(frame.fd && frame.bitrate_switch && !frame.extended);
+        assert_eq!(frame.data.len(), 16);
+        assert_eq!(&frame.data[..4], &[0x20, 0xE0, 0x02, 0x00]);
+
+        assert!(
+            parse_slcan_frame("b2728").is_none(),
+            "a DLC without its payload is not a frame"
+        );
+
+        let frame = parse_slcan_frame("b27280000E08700001EFE").unwrap();
+        assert_eq!(frame.id, 0x272);
+        assert!(frame.fd && frame.bitrate_switch);
+        assert_eq!(
+            frame.data,
+            vec![0x00, 0x00, 0xE0, 0x87, 0x00, 0x00, 0x1E, 0xFE]
+        );
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_fd_frames_without_bitrate_switch() {
+        let standard = parse_slcan_frame("d1A09010203040506070809101112").unwrap();
+        assert!(standard.fd && !standard.bitrate_switch && !standard.extended);
+        // DLC nibble 9 is 12 bytes, not 9.
+        assert_eq!(standard.data.len(), 12);
+
+        let extended = parse_slcan_frame("D18DAF1109010203040506070809101112").unwrap();
+        assert_eq!(extended.id, 0x18DAF110);
+        assert!(extended.fd && extended.extended && !extended.bitrate_switch);
+        assert_eq!(extended.data.len(), 12);
+    }
+
+    #[test]
+    fn parse_slcan_frame_reads_an_fd_dlc_nibble_not_a_byte_count() {
+        // Nibble F is 64 bytes; read as a decimal length it would be nonsense.
+        let hex = "AB".repeat(64);
+        let frame = parse_slcan_frame(&format!("b100F{hex}")).unwrap();
+        assert_eq!(frame.data.len(), 64);
+
+        // The same nibble on a classic frame is not a length at all.
+        assert!(parse_slcan_frame(&format!("t100F{hex}")).is_none());
+    }
+
+    #[test]
+    fn format_slcan_frame_pads_an_fd_payload_up_to_the_next_dlc() {
+        // 10 bytes is not an expressible CAN FD length; 12 (DLC 9) is.
+        let line = format_slcan_frame(0x1A0, false, true, true, &[0xAA; 10]).unwrap();
+        assert!(line.starts_with("b1A09"), "got {line}");
+
+        let frame = parse_slcan_frame(&line).unwrap();
+        assert_eq!(frame.data.len(), 12);
+        assert_eq!(&frame.data[..10], &[0xAA; 10]);
+        assert_eq!(&frame.data[10..], &[0x00, 0x00], "padded with zeros");
+    }
+
+    #[test]
+    fn format_slcan_frame_rejects_payloads_no_frame_can_carry() {
+        assert!(format_slcan_frame(0x1A0, false, false, false, &[0; 9]).is_err());
+        assert!(format_slcan_frame(0x1A0, false, true, true, &[0; 65]).is_err());
+        // Classic tops out at 8, FD carries the same payload happily.
+        assert!(format_slcan_frame(0x1A0, false, false, false, &[0; 8]).is_ok());
+        assert!(format_slcan_frame(0x1A0, false, true, true, &[0; 64]).is_ok());
+    }
+
+    #[test]
+    fn fd_dlc_for_rounds_up_to_the_next_expressible_length() {
+        assert_eq!(fd_dlc_for(0), Some((0, 0)));
+        assert_eq!(fd_dlc_for(8), Some((8, 8)));
+        assert_eq!(fd_dlc_for(9), Some((9, 12)));
+        assert_eq!(fd_dlc_for(16), Some((10, 16)));
+        assert_eq!(fd_dlc_for(33), Some((14, 48)));
+        assert_eq!(fd_dlc_for(64), Some((15, 64)));
+        assert_eq!(fd_dlc_for(65), None);
     }
 
     #[test]

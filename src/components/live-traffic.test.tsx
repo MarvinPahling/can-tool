@@ -39,6 +39,8 @@ function frame(overrides: Partial<CanFrame> = {}): CanFrame {
 	return {
 		id: 0x1a0,
 		extended: false,
+		fd: false,
+		bitrate_switch: false,
 		data: [5],
 		timestamp_ms: 1000,
 		...overrides,

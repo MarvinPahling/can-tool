@@ -9,6 +9,8 @@ function makeFrame(overrides: Partial<CanFrame> = {}): CanFrame {
 	return {
 		id: 100,
 		extended: false,
+		fd: false,
+		bitrate_switch: false,
 		data: [0, 0],
 		timestamp_ms: 1000,
 		...overrides,
@@ -31,6 +33,27 @@ const dbc = makeDbcFile({
 const empty: LiveState = new Map();
 
 describe("applyFrames", () => {
+	it("carries the CAN FD flags of the latest frame", () => {
+		const state = applyFrames(
+			empty,
+			[
+				makeFrame({
+					fd: true,
+					bitrate_switch: true,
+					data: new Array(16).fill(1),
+				}),
+			],
+			dbc,
+			settings,
+		);
+
+		const live = state.get(100);
+		expect(live?.fd).toBe(true);
+		expect(live?.bitrateSwitch).toBe(true);
+		// A 16-byte payload is FD-only, and nothing in the fold truncates it.
+		expect(live?.data).toHaveLength(16);
+	});
+
 	it("decodes a frame into its named signals", () => {
 		const state = applyFrames(
 			empty,

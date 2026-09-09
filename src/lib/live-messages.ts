@@ -21,6 +21,10 @@ export interface LiveMessage {
 	message?: DbcMessage;
 	id: number;
 	extended: boolean;
+	/** The latest frame for this id was CAN FD. */
+	fd: boolean;
+	/** The latest frame for this id switched to the faster data bitrate. */
+	bitrateSwitch: boolean;
 	data: number[];
 	receivedAt: number;
 	count: number;
@@ -104,6 +108,8 @@ export function applyFrames(
 			message: definition?.message,
 			id: frame.id,
 			extended: frame.extended,
+			fd: frame.fd,
+			bitrateSwitch: frame.bitrate_switch,
 			data: frame.data,
 			receivedAt: frame.timestamp_ms,
 			count: (previous?.count ?? 0) + 1,

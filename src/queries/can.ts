@@ -36,12 +36,15 @@ export function useConnectCanDevice() {
 		mutationFn: ({
 			portName,
 			bitrate,
+			dataBitrate,
 			readOnly,
 		}: {
 			portName: string;
 			bitrate: number;
+			/** The CAN FD data bitrate, or null for a classic CAN channel. */
+			dataBitrate: number | null;
 			readOnly: boolean;
-		}) => connectCanDevice(portName, bitrate, readOnly),
+		}) => connectCanDevice(portName, bitrate, dataBitrate, readOnly),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["can", "status"] });
 			queryClient.invalidateQueries({ queryKey: ["can", "devices"] });
@@ -50,9 +53,10 @@ export function useConnectCanDevice() {
 }
 
 /**
- * Runs a bitrate sweep on one port. Resolves to the detected bitrate, or null
- * when nothing was heard; on a hit the backend leaves the device connected at
- * that rate, hence the same invalidations as a plain connect.
+ * Runs a timing sweep on one port. Resolves to the detected arbitration and
+ * data bitrate, or null when nothing was heard; on a hit the backend leaves the
+ * device connected at that timing, hence the same invalidations as a plain
+ * connect.
  */
 export function useAutodetectBitrate() {
 	const queryClient = useQueryClient();

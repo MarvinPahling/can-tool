@@ -48,6 +48,11 @@ export function LiveMessageCard({
 					)}
 					<span>·</span>
 					<span>{`${live.count} frames`}</span>
+					{/* Only worth the space when it is true: on a classic bus no card
+					    would ever carry these, and on an FD bus the plain frames are
+					    the ones that stand out. */}
+					{live.fd && <Badge variant="outline">FD</Badge>}
+					{live.bitrateSwitch && <Badge variant="outline">BRS</Badge>}
 				</div>
 			</CardHeader>
 

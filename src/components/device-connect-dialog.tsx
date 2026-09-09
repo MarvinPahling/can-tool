@@ -38,15 +38,43 @@ const BITRATES = [
 	{ value: 125_000, label: "125 kbit/s" },
 	{ value: 250_000, label: "250 kbit/s" },
 	{ value: 500_000, label: "500 kbit/s" },
-	{ value: 800_000, label: "800 kbit/s" },
+	// The CANable firmware's `S7` is 750 kbit/s, not the 800 of the original
+	// LAWICEL table; see `bitrate_code` in `src-tauri/src/can.rs`.
+	{ value: 750_000, label: "750 kbit/s" },
 	{ value: 1_000_000, label: "1 Mbit/s" },
 ];
+
+/** The data-phase rates the slcan `Y<n>` command can express, plus classic CAN. */
+const DATA_BITRATE_OPTIONS = [
+	{ value: null, label: "Off (classic CAN)" },
+	{ value: 2_000_000, label: "2 Mbit/s" },
+	{ value: 5_000_000, label: "5 Mbit/s" },
+	{ value: 8_000_000, label: "8 Mbit/s" },
+];
+
+/** Select components need a string; `null` is a real choice, not an absence. */
+const CLASSIC = "classic";
 
 function formatBitrate(value: number) {
 	return (
 		BITRATES.find((option) => option.value === value)?.label ??
 		`${value.toLocaleString()} bit/s`
 	);
+}
+
+function formatDataBitrate(value: number | null) {
+	const option = DATA_BITRATE_OPTIONS.find((entry) => entry.value === value);
+	if (option) return option.label;
+	return value === null
+		? "Off (classic CAN)"
+		: `${value.toLocaleString()} bit/s`;
+}
+
+/** How a swept or configured timing reads in one line: `500 kbit/s / 2 Mbit/s`. */
+function formatTiming(bitrate: number, dataBitrate: number | null) {
+	return dataBitrate === null
+		? formatBitrate(bitrate)
+		: `${formatBitrate(bitrate)} / ${formatDataBitrate(dataBitrate)} data`;
 }
 
 export function DeviceConnectDialog() {
@@ -78,9 +106,9 @@ export function DeviceConnectDialog() {
 	useProbeProgress((progress) => {
 		if (progress.done) return;
 		setProbeStatus(
-			`Trying ${formatBitrate(progress.bitrate)} — ${progress.frames} ${
-				progress.frames === 1 ? "frame" : "frames"
-			}`,
+			`Trying ${formatTiming(progress.bitrate, progress.data_bitrate)} — ${
+				progress.frames
+			} ${progress.frames === 1 ? "frame" : "frames"}`,
 		);
 	});
 
@@ -91,7 +119,7 @@ export function DeviceConnectDialog() {
 			{ portName: selectedPort, readOnly: settings.readOnly },
 			{
 				onSuccess: (detected) => {
-					if (detected === null) {
+					if (!detected) {
 						// Deliberately left on screen: a silent bus and a wrong
 						// adapter setup look identical from here, so the user has to
 						// read this one.
@@ -100,7 +128,10 @@ export function DeviceConnectDialog() {
 						);
 						return;
 					}
-					setBitrate(detected);
+					// The backend reports an absent data bitrate as a missing key,
+					// so normalize it back to the null this form is built around.
+					setBitrate(detected.bitrate);
+					setSettings({ dataBitrate: detected.data_bitrate ?? null });
 					setProbeStatus(null);
 				},
 				onError: (error) => {
@@ -136,8 +167,12 @@ export function DeviceConnectDialog() {
 					<Alert>
 						<AlertTitle>Connected</AlertTitle>
 						<AlertDescription>
-							{status.data.port_name} @ {status.data.bitrate.toLocaleString()}{" "}
-							bit/s{status.data.read_only && " · read-only"}
+							{status.data.port_name} @{" "}
+							{formatTiming(
+								status.data.bitrate,
+								status.data.data_bitrate ?? null,
+							)}
+							{status.data.read_only && " · read-only"}
 						</AlertDescription>
 					</Alert>
 				)}
@@ -206,7 +241,8 @@ export function DeviceConnectDialog() {
 						<span className="block text-sm font-medium">Read-only mode</span>
 						<span className="block text-xs text-muted-foreground">
 							Receive only; the adapter will not transmit or ACK. Some adapters
-							stop receiving entirely in this mode.
+							stop receiving entirely in this mode, and the CANable 2.0 firmware
+							stops delivering the full CAN FD traffic.
 						</span>
 					</span>
 					<Switch
@@ -217,12 +253,12 @@ export function DeviceConnectDialog() {
 					/>
 				</label>
 
-				<div className="flex items-center gap-2">
+				<div className="flex flex-wrap items-center gap-2">
 					<Select
 						value={String(bitrate)}
 						onValueChange={(value) => value && setBitrate(Number(value))}
 					>
-						<SelectTrigger className="w-40">
+						<SelectTrigger className="w-36" aria-label="Bitrate">
 							<SelectValue placeholder="Bitrate">
 								{(value: string | null) =>
 									BITRATES.find((option) => String(option.value) === value)
@@ -233,6 +269,43 @@ export function DeviceConnectDialog() {
 						<SelectContent>
 							{BITRATES.map((option) => (
 								<SelectItem key={option.value} value={String(option.value)}>
+									{option.label}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
+
+					<Select
+						value={
+							settings.dataBitrate === null
+								? CLASSIC
+								: String(settings.dataBitrate)
+						}
+						onValueChange={(value) =>
+							value &&
+							setSettings({
+								dataBitrate: value === CLASSIC ? null : Number(value),
+							})
+						}
+					>
+						<SelectTrigger className="w-44 flex-1" aria-label="Data bitrate">
+							<SelectValue placeholder="Data bitrate">
+								{(value: string | null) =>
+									DATA_BITRATE_OPTIONS.find(
+										(option) =>
+											(option.value === null
+												? CLASSIC
+												: String(option.value)) === value,
+									)?.label ?? "Data bitrate"
+								}
+							</SelectValue>
+						</SelectTrigger>
+						<SelectContent>
+							{DATA_BITRATE_OPTIONS.map((option) => (
+								<SelectItem
+									key={option.label}
+									value={option.value === null ? CLASSIC : String(option.value)}
+								>
 									{option.label}
 								</SelectItem>
 							))}
@@ -271,6 +344,7 @@ export function DeviceConnectDialog() {
 								connect.mutate({
 									portName: selectedPort,
 									bitrate,
+									dataBitrate: settings.dataBitrate,
 									readOnly: settings.readOnly,
 								})
 							}
