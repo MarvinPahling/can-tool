@@ -2,16 +2,8 @@ import { LiveSignalValue } from "@/components/live-signal-value";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { LiveMessage } from "@/lib/live-messages";
-import { bytesToHex } from "@/lib/utils";
+import { bytesToHex, formatCanId } from "@/lib/utils";
 import type { VisualizeSettings } from "@/lib/visualize-settings";
-
-/** Formats a CAN id the way it is written on a bus: hex, width by frame format. */
-function formatCanId(id: number, extended: boolean): string {
-	return `0x${id
-		.toString(16)
-		.toUpperCase()
-		.padStart(extended ? 8 : 3, "0")}`;
-}
 
 /**
  * The latest frame for one CAN id: its decoded signals, each flashing as it

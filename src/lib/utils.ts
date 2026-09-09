@@ -11,3 +11,14 @@ export function bytesToHex(bytes: number[]): string {
 		.map((b) => b.toString(16).padStart(2, "0").toUpperCase())
 		.join(" ");
 }
+
+/**
+ * Formats a CAN id the way it is written on a bus: hex, width by frame format
+ * — three nibbles for a standard id, eight for an extended one.
+ */
+export function formatCanId(id: number, extended: boolean): string {
+	return `0x${id
+		.toString(16)
+		.toUpperCase()
+		.padStart(extended ? 8 : 3, "0")}`;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cn } from "./utils";
+import { bytesToHex, cn, formatCanId } from "./utils";
 
 describe("cn", () => {
 	it("joins class names", () => {
@@ -16,5 +16,26 @@ describe("cn", () => {
 
 	it("applies conditional class objects", () => {
 		expect(cn("base", { active: true, hidden: false })).toBe("base active");
+	});
+});
+
+describe("bytesToHex", () => {
+	it("formats bytes as uppercase space-separated hex", () => {
+		expect(bytesToHex([0xde, 0xad, 0x00])).toBe("DE AD 00");
+	});
+
+	it("is empty for an empty frame", () => {
+		expect(bytesToHex([])).toBe("");
+	});
+});
+
+describe("formatCanId", () => {
+	it("pads a standard id to three nibbles", () => {
+		expect(formatCanId(0x1a0, false)).toBe("0x1A0");
+		expect(formatCanId(0x7, false)).toBe("0x007");
+	});
+
+	it("pads an extended id to eight", () => {
+		expect(formatCanId(0x999, true)).toBe("0x00000999");
 	});
 });
