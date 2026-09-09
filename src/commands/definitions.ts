@@ -32,6 +32,12 @@ export const COMMANDS = [
 		defaultBinding: "Mod+2",
 	},
 	{
+		id: "view.simulate",
+		label: "Simulation",
+		description: "Compose messages and cycle them onto the bus",
+		defaultBinding: "Mod+3",
+	},
+	{
 		id: "app.showShortcuts",
 		label: "Keyboard Shortcuts…",
 		description: "Show all shortcuts and let you customize them",

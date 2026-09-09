@@ -14,6 +14,7 @@ const appWindow = getCurrentWindow();
 const NAV_LINKS = [
 	{ to: "/", label: "DBC" },
 	{ to: "/visualize", label: "Live" },
+	{ to: "/simulate", label: "Simulate" },
 ] as const;
 
 export function Titlebar() {
@@ -24,6 +25,7 @@ export function Titlebar() {
 	useCommandHandler("app.toggleTheme", cycleTheme);
 	useCommandHandler("view.dbc", () => navigate({ to: "/" }));
 	useCommandHandler("view.visualize", () => navigate({ to: "/visualize" }));
+	useCommandHandler("view.simulate", () => navigate({ to: "/simulate" }));
 
 	useEffect(() => {
 		appWindow.isMaximized().then(setIsMaximized);

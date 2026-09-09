@@ -80,9 +80,14 @@ pub fn run() {
                 .accelerator("CmdOrCtrl+2")
                 .build(handle)?;
 
+            let view_simulate = MenuItemBuilder::with_id("view.simulate", "Simulation")
+                .accelerator("CmdOrCtrl+3")
+                .build(handle)?;
+
             let view_menu = SubmenuBuilder::new(handle, "View")
                 .item(&view_dbc)
                 .item(&view_visualize)
+                .item(&view_simulate)
                 .build()?;
 
             let edit_menu = SubmenuBuilder::new(handle, "Edit")
