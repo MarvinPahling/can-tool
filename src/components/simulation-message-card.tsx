@@ -157,8 +157,12 @@ export function SimulationMessageCard({
 							message={message}
 							values={entry.values}
 							signalName={entry.checksumSignal}
+							auto={entry.checksumAuto}
 							onSignalNameChange={(signalName) =>
 								updateSimulationEntry(entry.id, { checksumSignal: signalName })
+							}
+							onAutoChange={(auto) =>
+								updateSimulationEntry(entry.id, { checksumAuto: auto })
 							}
 							onGenerated={setValue}
 						/>

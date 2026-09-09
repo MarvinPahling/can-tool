@@ -221,6 +221,18 @@ describe("SimulationMessageCard", () => {
 		expect(screen.queryByText("Sending")).toBeNull();
 	});
 
+	it("remembers the auto-checksum toggle", async () => {
+		const entry = seedEntry(String(speed.id));
+		updateSimulationEntry(entry().id, { checksumSignal: "Checksum" });
+		renderCard(entry);
+
+		await userEvent.click(
+			screen.getByRole("switch", { name: /auto checksum/i }),
+		);
+
+		expect(entry().checksumAuto).toBe(true);
+	});
+
 	it("removes the entry from the store", async () => {
 		const entry = seedEntry(String(gear.id));
 		renderCard(entry);

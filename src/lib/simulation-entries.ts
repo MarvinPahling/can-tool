@@ -29,6 +29,8 @@ export interface SimulationEntry {
 	periodMs: number;
 	/** Which signal the checksum generator writes into; empty for none. */
 	checksumSignal: string;
+	/** Recompute that checksum whenever another value changes. */
+	checksumAuto: boolean;
 	/** Unchecked entries stay on the board but are left out of a run. */
 	enabled: boolean;
 }
@@ -91,6 +93,9 @@ export function parseSimulationEntries(raw: unknown): SimulationEntry[] {
 			),
 			checksumSignal:
 				typeof entry.checksumSignal === "string" ? entry.checksumSignal : "",
+			// Off unless it was deliberately turned on: an automatic write is a
+			// surprise on a bus, so it is not something to default into.
+			checksumAuto: entry.checksumAuto === true,
 			// Absent means enabled: an entry the user put on the board is one
 			// they meant to send.
 			enabled: typeof entry.enabled === "boolean" ? entry.enabled : true,
@@ -143,6 +148,7 @@ export function addSimulationEntry(messageId = ""): string {
 						values: {},
 						periodMs: DEFAULT_PERIOD_MS,
 						checksumSignal: "",
+						checksumAuto: false,
 						enabled: true,
 					},
 				],

@@ -192,6 +192,7 @@ function FrameRow({
 		(state: { values: SendFormValues }) => state.values.frames[index],
 	);
 	const [checksumSignal, setChecksumSignal] = useState("");
+	const [checksumAuto, setChecksumAuto] = useState(false);
 
 	const selectedMessage = messages.find(
 		(message) => String(message.id) === frame?.messageId,
@@ -211,6 +212,7 @@ function FrameRow({
 						form.setFieldValue(`frames[${index}].messageId`, value ?? "");
 						form.setFieldValue(`frames[${index}].values`, {});
 						setChecksumSignal("");
+						setChecksumAuto(false);
 					}}
 				>
 					<SelectTrigger className="w-56">
@@ -260,7 +262,9 @@ function FrameRow({
 						message={selectedMessage}
 						values={values}
 						signalName={checksumSignal}
+						auto={checksumAuto}
 						onSignalNameChange={setChecksumSignal}
+						onAutoChange={setChecksumAuto}
 						onGenerated={setValue}
 					/>
 

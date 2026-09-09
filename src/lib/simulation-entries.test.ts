@@ -25,6 +25,7 @@ function entry(overrides: Record<string, unknown> = {}) {
 		values: { Value: 1 },
 		periodMs: 20,
 		checksumSignal: "",
+		checksumAuto: false,
 		enabled: true,
 		...overrides,
 	};
@@ -176,6 +177,21 @@ describe("parseSimulationEntries", () => {
 		expect(
 			parseSimulationEntries([entry({ enabled: false })])[0]?.enabled,
 		).toBe(false);
+	});
+
+	it("defaults the auto-checksum flag to off", () => {
+		// An automatic write is a surprise on a bus; only an explicit true
+		// turns it on.
+		expect(
+			parseSimulationEntries([entry({ checksumAuto: undefined })])[0]
+				?.checksumAuto,
+		).toBe(false);
+		expect(
+			parseSimulationEntries([entry({ checksumAuto: "yes" })])[0]?.checksumAuto,
+		).toBe(false);
+		expect(
+			parseSimulationEntries([entry({ checksumAuto: true })])[0]?.checksumAuto,
+		).toBe(true);
 	});
 
 	it("truncates a board past the maximum", () => {
