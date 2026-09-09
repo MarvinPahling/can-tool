@@ -33,3 +33,4 @@ src-tauri/WebView2Runtime
 *.njsproj
 *.sln
 *.sw?
+ignore/canable
