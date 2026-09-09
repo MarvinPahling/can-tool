@@ -10,6 +10,7 @@ use serialport::{ClearBuffer, SerialPort, SerialPortType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
+use crate::simulation::SimulationState;
 
 /// USB identity of a CANable 2.0 running its default slcan firmware.
 const CANABLE_VID: u16 = 0xad50;
@@ -336,11 +337,17 @@ fn open_connection(
 pub fn connect_can_device(
     app: AppHandle,
     state: State<CanState>,
+    sim_state: State<SimulationState>,
     port_name: String,
     bitrate: u32,
     data_bitrate: Option<u32>,
     read_only: bool,
 ) -> Result<(), String> {
+    // Before anything else, and before this mutex is taken: the scheduler is
+    // still writing to the connection about to be replaced. Stopping first is
+    // also what fixes the lock order as `SimulationState` before `CanState`.
+    crate::simulation::stop_running(&sim_state)?;
+
     // Racy by nature — the sweep could claim the flag right after this check —
     // but the loser then just fails to open the port, with a clearer message
     // than the OS would give.
@@ -564,6 +571,10 @@ pub async fn autodetect_bitrate(
     // freezes the webview. `spawn_blocking` moves it off, and the awaited
     // handle still resolves the invoke with the detected timing.
     tauri::async_runtime::spawn_blocking(move || {
+        // A sweep rewrites the channel with `C`/`S`/`Y`/`O`; `T` frames
+        // interleaved into that sequence would corrupt it and poison the
+        // frame counts the scoring is built on.
+        crate::simulation::stop_running(&app.state::<SimulationState>())?;
         let state = app.state::<CanState>();
         run_bitrate_sweep(&app, &state, &port_name, read_only)
     })
@@ -572,7 +583,12 @@ pub async fn autodetect_bitrate(
 }
 
 #[tauri::command]
-pub fn disconnect_can_device(state: State<CanState>) -> Result<(), String> {
+pub fn disconnect_can_device(
+    state: State<CanState>,
+    sim_state: State<SimulationState>,
+) -> Result<(), String> {
+    crate::simulation::stop_running(&sim_state)?;
+
     let mut guard = state
         .connection
         .lock()
@@ -982,7 +998,7 @@ fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
     pending > 0 && (pending >= RX_BATCH_CAP || since_last_flush >= RX_FLUSH_INTERVAL)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1031,7 +1047,7 @@ fn spawn_reader(
     })
 }
 
-fn write_frame(
+pub(crate) fn write_frame(
     port: &mut Box<dyn SerialPort>,
     id: u32,
     extended: bool,
@@ -1047,6 +1063,33 @@ fn write_frame(
         port,
         &format_slcan_frame(id, extended, fd, bitrate_switch, data)?,
     )
+}
+
+/// Hands the simulation scheduler its own write handle to the open port,
+/// along with the transmit format the channel is using.
+///
+/// The clone is the point. `open_connection` already gives the reader its own
+/// handle so it never contends with the writer for this mutex; the scheduler
+/// needs the same, because it writes on a millisecond cycle and
+/// `can_connection_status` is polled from the main thread every second. A
+/// write that blocks for `SERIAL_TIMEOUT` inside this lock is exactly the
+/// freeze the bitrate sweep was restructured to avoid.
+///
+/// Safe only because every slcan command goes out in a single `write_all` —
+/// three handles interleaving mid-command would corrupt the stream.
+pub(crate) fn clone_write_handle(
+    state: &CanState,
+) -> Result<(Box<dyn SerialPort>, bool, bool), String> {
+    let guard = state
+        .connection
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
+    let connection = guard.as_ref().ok_or("No CAN device connected")?;
+    ensure_writable(&connection.status)?;
+
+    let port = connection.port.try_clone().map_err(|e| e.to_string())?;
+    let (fd, brs) = tx_format(&connection.status);
+    Ok((port, fd, brs))
 }
 
 #[tauri::command]
