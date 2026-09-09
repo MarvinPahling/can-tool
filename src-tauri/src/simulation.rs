@@ -46,6 +46,10 @@ const COARSE_MARGIN: Duration = Duration::from_millis(12);
 /// busies instead. Kept short: this is the only phase that costs CPU.
 const SPIN_MARGIN: Duration = Duration::from_millis(1);
 
+/// One slice of the polling phase. Short enough that the overshoot it can
+/// contribute stays well inside the spin margin that follows it.
+const POLL_INTERVAL: Duration = Duration::from_micros(500);
+
 /// One message on the schedule: the frame to write, how often, and when next.
 ///
 /// The payload is encoded once when the simulation starts and never
@@ -243,17 +247,30 @@ pub fn validate_entries(
 
 /// Waits until `deadline`, giving up early when `stop` is set.
 ///
-/// Coarse only: this parks for the whole remaining time in one go, which the
-/// follow-up issue replaces with the poll-and-spin ladder. Parking rather than
-/// sleeping is already load-bearing though — `stop_running` unparks, so a stop
-/// is not held up by the longest cycle in the set.
+/// Three phases, tightening as the deadline approaches, because no single
+/// mechanism is both cheap and accurate. A plain timed wait on a background
+/// thread is cheap but coalesced — macOS in particular will let it overshoot a
+/// 20 ms deadline by up to 10 ms, which turns a restbus into a stream of late
+/// frames. A spin is accurate but burns a core. So: park for the bulk of it,
+/// sleep in short slices through the middle, and busy-wait only the last
+/// millisecond. The reference simulator holds 20.00 / 50.00 / 1000.0 ms
+/// average cycles this way at a few percent CPU.
+///
+/// The coarse phase parks rather than sleeps so `stop_running`'s `unpark` cuts
+/// it short; the finer two re-check `stop` on every slice. Between them, a stop
+/// is never held up by the longest cycle in the set.
 fn wait_until(deadline: Instant, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
+        // Saturating: by the time this is read the deadline may already have
+        // passed, and a negative `Instant` difference panics.
         let remaining = deadline.saturating_duration_since(Instant::now());
+
         match wait_phase(remaining) {
             WaitPhase::Done => return,
+            // A spurious wakeup just costs one more trip around the loop.
             WaitPhase::Coarse(coarse) => thread::park_timeout(coarse),
-            WaitPhase::Poll | WaitPhase::Spin => thread::park_timeout(remaining),
+            WaitPhase::Poll => thread::sleep(POLL_INTERVAL),
+            WaitPhase::Spin => std::hint::spin_loop(),
         }
     }
 }
@@ -577,8 +594,67 @@ mod tests {
     }
 
     #[test]
-    fn wait_phase_is_done_at_the_deadline() {
+    fn wait_phase_reports_done_at_or_past_the_deadline() {
         assert_eq!(wait_phase(Duration::ZERO), WaitPhase::Done);
+
+        // Past the deadline the caller's saturating subtraction floors at zero,
+        // so "late" and "exactly on time" arrive here as the same input.
+        let deadline = Instant::now();
+        let late = deadline + ms(5);
+        assert_eq!(
+            wait_phase(deadline.saturating_duration_since(late)),
+            WaitPhase::Done,
+            "a deadline already in the past must end the wait, not restart it"
+        );
+    }
+
+    #[test]
+    fn wait_phase_boundaries_do_not_skip_a_phase() {
+        assert_eq!(
+            wait_phase(COARSE_MARGIN),
+            WaitPhase::Poll,
+            "exactly at the coarse margin the coarse phase is over"
+        );
+        assert_eq!(
+            wait_phase(SPIN_MARGIN),
+            WaitPhase::Spin,
+            "exactly at the spin margin the polling phase is over"
+        );
+    }
+
+    #[test]
+    fn one_poll_slice_cannot_overshoot_past_the_spin_margin() {
+        assert!(
+            POLL_INTERVAL < SPIN_MARGIN,
+            "a poll slice that outlasts the spin margin could sleep straight through the deadline the spin exists to catch"
+        );
+        assert!(
+            SPIN_MARGIN < COARSE_MARGIN,
+            "the phases have to narrow, or the ladder has a gap"
+        );
+    }
+
+    #[test]
+    fn wait_until_returns_immediately_when_stop_is_already_set() {
+        let stop = AtomicBool::new(true);
+
+        // An hour out: only the stop flag can end this.
+        wait_until(Instant::now() + Duration::from_secs(3600), &stop);
+    }
+
+    #[test]
+    fn wait_until_does_not_return_before_the_deadline() {
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let deadline = started + ms(5);
+
+        wait_until(deadline, &stop);
+
+        assert!(
+            Instant::now() >= deadline,
+            "returning early is the one failure that would show up as jitter on the bus"
+        );
+        assert!(started.elapsed() >= ms(5));
     }
 
     #[test]
