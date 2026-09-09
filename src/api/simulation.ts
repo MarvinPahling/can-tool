@@ -3,10 +3,7 @@ import {
 	startSimulation as startSimulationCommand,
 	stopSimulation as stopSimulationCommand,
 } from "../generated/commands";
-import type { SimulationEntry } from "../generated/types";
 import type { DbcMessage } from "./dbc";
-
-export type { SimulationEntry };
 
 /** The event name the scheduler reports a mid-run failure on. */
 export const SIMULATION_ERROR_EVENT = "simulation-error";
