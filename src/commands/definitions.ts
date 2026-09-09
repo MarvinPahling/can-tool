@@ -55,12 +55,6 @@ export const COMMANDS = [
 		description: "Find and connect to a CAN adapter",
 		defaultBinding: "Mod+K",
 	},
-	{
-		id: "message.send",
-		label: "Send CAN Message…",
-		description: "Compose and transmit a CAN frame from the loaded DBC",
-		defaultBinding: "Mod+Shift+S",
-	},
 ] as const;
 
 // Type-only check: keeps each command's literal id/binding types (for

@@ -26,12 +26,6 @@ vi.mock("@/components/shortcuts-dialog", () => ({
 vi.mock("@/components/device-connect-dialog", () => ({
 	DeviceConnectDialog: () => null,
 }));
-// Deliberately stubbed out: the real dialog observes useCurrentDbc from the
-// root route, which would keep the cache entry alive on its own and hide the
-// garbage-collection case below.
-vi.mock("@/components/send-message-dialog", () => ({
-	SendMessageDialog: () => null,
-}));
 vi.mock("@/components/live-traffic", () => ({
 	LiveTraffic: () => <div>live traffic</div>,
 }));

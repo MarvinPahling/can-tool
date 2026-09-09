@@ -1,6 +1,6 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Keyboard, Minus, Send, Square, Usb, X } from "lucide-react";
+import { Copy, Keyboard, Minus, Square, Usb, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { runCommand, useCommandHandler } from "@/commands";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -67,15 +67,6 @@ export function Titlebar() {
 			</div>
 			<div className="flex h-full items-center">
 				<ThemeToggle />
-				<Button
-					variant="ghost"
-					size="icon"
-					className="h-full w-10 rounded-none"
-					title="Send CAN Message…"
-					onClick={() => runCommand("message.send")}
-				>
-					<Send />
-				</Button>
 				<Button
 					variant="ghost"
 					size="icon"

@@ -13,10 +13,10 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { useAddToSimulation } from "@/hooks/use-add-to-simulation";
 import { dbcColumns } from "@/lib/dbc-table/columns";
 import { dbcTableFeatures } from "@/lib/dbc-table/features";
 import { buildDbcRows, type DbcRow } from "@/lib/dbc-table/rows";
-import { useRequestSendMessage } from "@/lib/pending-send";
 import { cn } from "@/lib/utils";
 
 const modKeyLabel =
@@ -42,7 +42,7 @@ export function DbcTable({
 	hoveredSignal?: DbcSignal | null;
 	onSignalHover?: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
-	const requestSendMessage = useRequestSendMessage();
+	const addToSimulation = useAddToSimulation();
 	// Which messages are showing their signal rows. Resolved into the row list
 	// ourselves (see `buildDbcRows`) rather than via the table's row-expanding
 	// feature, whose expanded state doesn't reliably stick across re-renders.
@@ -135,7 +135,7 @@ export function DbcTable({
 					{table.getRowModel().rows.map((row) => (
 						<TableRow
 							key={row.id}
-							title={`${modKeyLabel}-click to send this message`}
+							title={`${modKeyLabel}-click to simulate this message`}
 							className={cn(
 								row.original.kind === "message" && "bg-primary/5",
 								row.original.kind === "signal" && "bg-muted/20",
@@ -152,7 +152,7 @@ export function DbcTable({
 							}
 							onClick={(e) => {
 								if (e.metaKey || e.ctrlKey) {
-									requestSendMessage(String(row.original.message.id));
+									addToSimulation(String(row.original.message.id));
 								}
 							}}
 						>
