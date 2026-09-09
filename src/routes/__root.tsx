@@ -7,7 +7,6 @@ import {
 import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import { CommandsProvider } from "@/commands";
 import { DeviceConnectDialog } from "@/components/device-connect-dialog";
-import { SendMessageDialog } from "@/components/send-message-dialog";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
 import { Titlebar } from "@/components/titlebar";
 
@@ -40,7 +39,6 @@ function RootComponent() {
 			</div>
 			<ShortcutsDialog />
 			<DeviceConnectDialog />
-			<SendMessageDialog />
 		</CommandsProvider>
 	);
 }

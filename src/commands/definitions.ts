@@ -32,6 +32,12 @@ export const COMMANDS = [
 		defaultBinding: "Mod+2",
 	},
 	{
+		id: "view.simulate",
+		label: "Simulation",
+		description: "Compose messages and cycle them onto the bus",
+		defaultBinding: "Mod+3",
+	},
+	{
 		id: "app.showShortcuts",
 		label: "Keyboard Shortcuts…",
 		description: "Show all shortcuts and let you customize them",
@@ -48,12 +54,6 @@ export const COMMANDS = [
 		label: "Connect Device…",
 		description: "Find and connect to a CAN adapter",
 		defaultBinding: "Mod+K",
-	},
-	{
-		id: "message.send",
-		label: "Send CAN Message…",
-		description: "Compose and transmit a CAN frame from the loaded DBC",
-		defaultBinding: "Mod+Shift+S",
 	},
 ] as const;
 

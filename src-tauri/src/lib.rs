@@ -1,5 +1,6 @@
 mod can;
 mod dbc;
+pub mod simulation;
 
 use can::{
     autodetect_bitrate, can_connection_status, connect_can_device, disconnect_can_device,
@@ -7,6 +8,7 @@ use can::{
     CanState,
 };
 use dbc::parse_dbc_file;
+use simulation::{simulation_status, start_simulation, stop_simulation, SimulationState};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     Emitter,
@@ -28,6 +30,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(CanState::default())
+        .manage(SimulationState::default())
         .invoke_handler(tauri::generate_handler![
             parse_dbc_file,
             list_can_devices,
@@ -39,6 +42,9 @@ pub fn run() {
             generate_checksum,
             send_can_frame,
             send_can_message,
+            start_simulation,
+            stop_simulation,
+            simulation_status,
         ])
         .menu(|handle| {
             // On macOS the *first* top-level submenu is always coerced into the
@@ -74,9 +80,14 @@ pub fn run() {
                 .accelerator("CmdOrCtrl+2")
                 .build(handle)?;
 
+            let view_simulate = MenuItemBuilder::with_id("view.simulate", "Simulation")
+                .accelerator("CmdOrCtrl+3")
+                .build(handle)?;
+
             let view_menu = SubmenuBuilder::new(handle, "View")
                 .item(&view_dbc)
                 .item(&view_visualize)
+                .item(&view_simulate)
                 .build()?;
 
             let edit_menu = SubmenuBuilder::new(handle, "Edit")

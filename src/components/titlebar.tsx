@@ -1,6 +1,6 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Copy, Keyboard, Minus, Send, Square, Usb, X } from "lucide-react";
+import { Copy, Keyboard, Minus, Square, Usb, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { runCommand, useCommandHandler } from "@/commands";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -14,6 +14,7 @@ const appWindow = getCurrentWindow();
 const NAV_LINKS = [
 	{ to: "/", label: "DBC" },
 	{ to: "/visualize", label: "Live" },
+	{ to: "/simulate", label: "Simulate" },
 ] as const;
 
 export function Titlebar() {
@@ -24,6 +25,7 @@ export function Titlebar() {
 	useCommandHandler("app.toggleTheme", cycleTheme);
 	useCommandHandler("view.dbc", () => navigate({ to: "/" }));
 	useCommandHandler("view.visualize", () => navigate({ to: "/visualize" }));
+	useCommandHandler("view.simulate", () => navigate({ to: "/simulate" }));
 
 	useEffect(() => {
 		appWindow.isMaximized().then(setIsMaximized);
@@ -65,15 +67,6 @@ export function Titlebar() {
 			</div>
 			<div className="flex h-full items-center">
 				<ThemeToggle />
-				<Button
-					variant="ghost"
-					size="icon"
-					className="h-full w-10 rounded-none"
-					title="Send CAN Message…"
-					onClick={() => runCommand("message.send")}
-				>
-					<Send />
-				</Button>
 				<Button
 					variant="ghost"
 					size="icon"

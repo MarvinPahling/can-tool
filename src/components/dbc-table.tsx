@@ -1,8 +1,9 @@
 import { useTable } from "@tanstack/react-table";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import type { Ref } from "react";
 import { useMemo, useState } from "react";
 import type { DbcFile, DbcMessage, DbcSignal } from "@/api/dbc";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
 	Table,
@@ -13,10 +14,10 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { useAddToSimulation } from "@/hooks/use-add-to-simulation";
 import { dbcColumns } from "@/lib/dbc-table/columns";
 import { dbcTableFeatures } from "@/lib/dbc-table/features";
 import { buildDbcRows, type DbcRow } from "@/lib/dbc-table/rows";
-import { useRequestSendMessage } from "@/lib/pending-send";
 import { cn } from "@/lib/utils";
 
 const modKeyLabel =
@@ -42,7 +43,7 @@ export function DbcTable({
 	hoveredSignal?: DbcSignal | null;
 	onSignalHover?: (signal: DbcSignal | null, message?: DbcMessage) => void;
 }) {
-	const requestSendMessage = useRequestSendMessage();
+	const addToSimulation = useAddToSimulation();
 	// Which messages are showing their signal rows. Resolved into the row list
 	// ourselves (see `buildDbcRows`) rather than via the table's row-expanding
 	// feature, whose expanded state doesn't reliably stick across re-renders.
@@ -53,6 +54,20 @@ export function DbcTable({
 		() => buildDbcRows(dbc, expandedMessageIds),
 		[dbc, expandedMessageIds],
 	);
+
+	// Expansion is all-or-nothing here rather than "everything the filter
+	// leaves showing": the filter is a search, and collapsing what you cannot
+	// see would leave the table in a state you did not ask for once it clears.
+	const allExpanded = expandedMessageIds.size === dbc.messages.length;
+	const noneExpanded = expandedMessageIds.size === 0;
+
+	function expandAll() {
+		setExpandedMessageIds(new Set(dbc.messages.map((message) => message.id)));
+	}
+
+	function collapseAll() {
+		setExpandedMessageIds(new Set());
+	}
 
 	function toggleMessageExpanded(messageId: number) {
 		setExpandedMessageIds((old) => {
@@ -81,7 +96,7 @@ export function DbcTable({
 
 	return (
 		<div className="space-y-3">
-			<div className="flex items-center justify-between gap-3">
+			<div className="flex flex-wrap items-center gap-3">
 				<Input
 					ref={filterInputRef}
 					placeholder="Filter messages and signals…"
@@ -89,9 +104,29 @@ export function DbcTable({
 					onChange={(e) => table.setGlobalFilter(e.target.value)}
 					className="max-w-xs"
 				/>
+				<Button
+					type="button"
+					variant="outline"
+					size="sm"
+					disabled={allExpanded}
+					onClick={expandAll}
+				>
+					<ChevronsUpDown className="size-4" />
+					Expand all
+				</Button>
+				<Button
+					type="button"
+					variant="outline"
+					size="sm"
+					disabled={noneExpanded}
+					onClick={collapseAll}
+				>
+					<ChevronsDownUp className="size-4" />
+					Collapse all
+				</Button>
 				<table.Subscribe selector={(state) => state.globalFilter}>
 					{() => (
-						<span className="text-xs text-muted-foreground">
+						<span className="ml-auto text-xs text-muted-foreground">
 							{table.getRowModel().rows.length} message(s)
 						</span>
 					)}
@@ -135,7 +170,7 @@ export function DbcTable({
 					{table.getRowModel().rows.map((row) => (
 						<TableRow
 							key={row.id}
-							title={`${modKeyLabel}-click to send this message`}
+							title={`${modKeyLabel}-click to simulate this message`}
 							className={cn(
 								row.original.kind === "message" && "bg-primary/5",
 								row.original.kind === "signal" && "bg-muted/20",
@@ -152,7 +187,7 @@ export function DbcTable({
 							}
 							onClick={(e) => {
 								if (e.metaKey || e.ctrlKey) {
-									requestSendMessage(String(row.original.message.id));
+									addToSimulation(String(row.original.message.id));
 								}
 							}}
 						>
