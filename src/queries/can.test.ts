@@ -27,6 +27,7 @@ const frame: CanFrame = {
 	extended: false,
 	fd: false,
 	bitrate_switch: false,
+	remote: false,
 	data: [0xde, 0xad],
 	timestamp_ms: 1,
 };

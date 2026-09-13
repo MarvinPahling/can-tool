@@ -11,6 +11,7 @@ function makeFrame(overrides: Partial<CanFrame> = {}): CanFrame {
 		extended: false,
 		fd: false,
 		bitrate_switch: false,
+		remote: false,
 		data: [0, 0],
 		timestamp_ms: 1000,
 		...overrides,

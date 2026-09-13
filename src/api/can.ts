@@ -39,7 +39,18 @@ export interface CanFrame {
 	fd: boolean;
 	/** CAN FD only: the data phase ran at the faster data bitrate. */
 	bitrate_switch: boolean;
+	/**
+	 * A remote-request frame: it declares a length but carries no payload,
+	 * which is otherwise indistinguishable from a zero-length data frame.
+	 */
+	remote: boolean;
 	data: number[];
+	/**
+	 * Epoch milliseconds, with a fractional part — the Rust side stamps each
+	 * frame individually from a monotonic, epoch-anchored `FrameClock`. Do not
+	 * assume whole milliseconds; two frames from one serial read differ by
+	 * microseconds.
+	 */
 	timestamp_ms: number;
 }
 

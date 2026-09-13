@@ -442,7 +442,9 @@ fn probe_candidate(
             Ok(0) => thread::sleep(Duration::from_millis(1)),
             Ok(n) => {
                 buf.push_str(&String::from_utf8_lossy(&raw[..n]));
-                tally.observe(&drain_lines(&mut buf, now_ms()));
+                // The sweep only counts frames and their FD/BRS flags, so it
+                // has no use for a timestamp and skips reading the clock.
+                tally.observe(&drain_lines(&mut buf, || 0.0));
             }
             // Timeouts are how a silent bus looks — keep listening.
             Err(e) if e.kind() == ErrorKind::TimedOut => {}
@@ -779,8 +781,13 @@ pub struct CanFrame {
     pub fd: bool,
     /// CAN FD only: the data phase ran at the faster data bitrate.
     pub bitrate_switch: bool,
+    /// A remote-request frame (`r`/`R`): it declares a length but carries no
+    /// payload, which is otherwise indistinguishable from a DLC-0 data frame.
+    pub remote: bool,
     pub data: Vec<u8>,
-    pub timestamp_ms: u64,
+    /// Epoch milliseconds, with a fractional part. Stamped per frame by the
+    /// reader, from a `FrameClock`.
+    pub timestamp_ms: f64,
 }
 
 /// The widest id each frame format can carry: 11 bits standard, 29 extended.
@@ -931,8 +938,9 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
         extended,
         fd,
         bitrate_switch,
+        remote,
         data,
-        timestamp_ms: 0,
+        timestamp_ms: 0.0,
     })
 }
 
@@ -970,7 +978,19 @@ struct RxBatch {
 /// Lines end in `\r`, or in the BEL byte the adapter sends to reject a frame
 /// we transmitted. BEL is counted rather than parsed: it is the ack that
 /// `write_frame` used to read inline, and which now belongs to this thread.
-fn drain_lines(buf: &mut String, timestamp_ms: u64) -> RxBatch {
+///
+/// `now` is read **once per parsed frame**, not once per call. One 1 KiB read
+/// can complete dozens of frames, and stamping them all from a single reading
+/// made a capture claim simultaneous bursts that never happened — which is
+/// precisely the arrival pattern the live view struggles with. It is a
+/// parameter rather than a call to the clock so the timestamps stay testable,
+/// the same rule `parse_slcan_frame` follows by leaving the field at zero.
+///
+/// This does not buy hardware timestamps. Frames that genuinely arrive inside
+/// one `port.read` are still separated only by the microseconds it takes to
+/// parse them; the resolution ceiling is the read cadence, and `python-can`
+/// works to the same one.
+fn drain_lines(buf: &mut String, mut now: impl FnMut() -> f64) -> RxBatch {
     let mut batch = RxBatch::default();
     let Some(end) = buf.rfind(['\r', '\u{7}']) else {
         if buf.len() > RX_BUFFER_LIMIT {
@@ -985,7 +1005,7 @@ fn drain_lines(buf: &mut String, timestamp_ms: u64) -> RxBatch {
             batch.rejections += 1;
         }
         if let Some(mut frame) = parse_slcan_frame(line) {
-            frame.timestamp_ms = timestamp_ms;
+            frame.timestamp_ms = now();
             batch.frames.push(frame);
         }
     }
@@ -1005,6 +1025,40 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Epoch-relative frame timestamps that cannot go backwards.
+///
+/// Two properties are needed at once and no single clock has both. A capture
+/// stores Unix epoch seconds, so the origin has to be wall-clock — but
+/// `SystemTime` can step sideways (NTP, a manual clock change, a laptop
+/// waking), and a replay reconstructs timing from inter-frame *deltas*, so one
+/// backwards step renders as a frame arriving before the one ahead of it.
+///
+/// Anchoring a monotonic `Instant` to one `SystemTime` reading keeps both:
+/// epoch-relative, and non-decreasing for the life of the connection. The
+/// anchor is taken once, per reader thread, so a long-running capture drifts
+/// against the wall clock rather than jumping — which is the trade a recording
+/// wants.
+pub(crate) struct FrameClock {
+    anchor_ms: f64,
+    start: Instant,
+}
+
+impl FrameClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            anchor_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1_000.0)
+                .unwrap_or(0.0),
+            start: Instant::now(),
+        }
+    }
+
+    pub(crate) fn now_ms(&self) -> f64 {
+        self.anchor_ms + self.start.elapsed().as_secs_f64() * 1_000.0
+    }
+}
+
 /// Reads the port until `stop` is set, emitting batched `can-frames` events.
 ///
 /// Owns its own handle (a `try_clone` of the connection's port) so it never
@@ -1019,6 +1073,7 @@ fn spawn_reader(
         let mut buf = String::new();
         let mut pending: Vec<CanFrame> = Vec::new();
         let mut last_flush = Instant::now();
+        let clock = FrameClock::new();
 
         while !stop.load(Ordering::Relaxed) {
             match port.read(&mut raw) {
@@ -1026,7 +1081,7 @@ fn spawn_reader(
                 Ok(0) => thread::sleep(Duration::from_millis(1)),
                 Ok(n) => {
                     buf.push_str(&String::from_utf8_lossy(&raw[..n]));
-                    let batch = drain_lines(&mut buf, now_ms());
+                    let batch = drain_lines(&mut buf, || clock.now_ms());
                     if batch.rejections > 0 {
                         let _ = app.emit("can-error", "Adapter rejected a frame");
                     }
@@ -1312,7 +1367,7 @@ mod tests {
     fn probe_tally_counts_fd_and_brs_frames() {
         let mut buf = String::from("b0A0A20E0020000000A990000000000000000\rt1A01FF\r\u{7}");
         let mut probed = ProbeTally::default();
-        probed.observe(&drain_lines(&mut buf, 0));
+        probed.observe(&drain_lines(&mut buf, || 0.0));
 
         assert_eq!(probed, tally(2, 1, 1, 1));
     }
@@ -1495,7 +1550,7 @@ mod tests {
             frame.data,
             vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]
         );
-        assert_eq!(frame.timestamp_ms, 0);
+        assert_eq!(frame.timestamp_ms, 0.0);
     }
 
     #[test]
@@ -1504,6 +1559,26 @@ mod tests {
         assert_eq!(frame.id, 0x18DAF110);
         assert!(frame.extended);
         assert_eq!(frame.data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn parse_slcan_frame_marks_a_remote_frame() {
+        // `r`/`R` were already recognized; the distinction was parsed and then
+        // thrown away, leaving a remote frame indistinguishable from a data
+        // frame with DLC 0 — which the capture format has a column for.
+        let remote = parse_slcan_frame("r1A08").unwrap();
+        assert!(remote.remote);
+        assert!(remote.data.is_empty());
+
+        let extended = parse_slcan_frame("R18DAF1108").unwrap();
+        assert!(extended.remote);
+        assert!(extended.extended);
+    }
+
+    #[test]
+    fn parse_slcan_frame_does_not_mark_a_data_frame_remote() {
+        assert!(!parse_slcan_frame("t1A01FF").unwrap().remote);
+        assert!(!parse_slcan_frame("b0A00").unwrap().remote);
     }
 
     #[test]
@@ -1694,7 +1769,7 @@ mod tests {
     #[test]
     fn drain_lines_extracts_complete_frames_and_keeps_the_partial() {
         let mut buf = String::from("t1A01FF\rt1A01EE\rt1A0");
-        let batch = drain_lines(&mut buf, 42);
+        let batch = drain_lines(&mut buf, || 42.0);
         assert_eq!(batch.frames.len(), 2);
         assert_eq!(batch.frames[0].data, vec![0xFF]);
         assert_eq!(batch.frames[1].data, vec![0xEE]);
@@ -1707,11 +1782,11 @@ mod tests {
         let mut buf = String::new();
 
         buf.push_str("t1A08DEAD");
-        let batch = drain_lines(&mut buf, 1);
+        let batch = drain_lines(&mut buf, || 1.0);
         assert!(batch.frames.is_empty(), "no terminator yet");
 
         buf.push_str("BEEF00112233\r");
-        let batch = drain_lines(&mut buf, 2);
+        let batch = drain_lines(&mut buf, || 2.0);
         assert_eq!(batch.frames.len(), 1);
         assert_eq!(
             batch.frames[0].data,
@@ -1721,17 +1796,88 @@ mod tests {
     }
 
     #[test]
-    fn drain_lines_stamps_every_frame_with_the_given_timestamp() {
-        let mut buf = String::from("t1A01FF\rt1A01EE\r");
-        let batch = drain_lines(&mut buf, 1234);
-        assert!(batch.frames.iter().all(|f| f.timestamp_ms == 1234));
+    fn drain_lines_stamps_each_frame_separately() {
+        // One `port.read` can complete dozens of frames. Stamping them all
+        // from a single clock reading is what made a recording claim bursts
+        // that never happened.
+        let mut buf = String::from("t1A01FF\rt1A01EE\rt1A01DD\r");
+        let mut tick = 0.0;
+        let batch = drain_lines(&mut buf, || {
+            tick += 0.25;
+            tick
+        });
+
+        let stamps: Vec<f64> = batch.frames.iter().map(|f| f.timestamp_ms).collect();
+        assert_eq!(
+            stamps,
+            vec![0.25, 0.5, 0.75],
+            "every frame must carry its own reading, in arrival order"
+        );
+    }
+
+    #[test]
+    fn drain_lines_keeps_a_sub_millisecond_timestamp() {
+        let mut buf = String::from("t1A01FF\r");
+        let batch = drain_lines(&mut buf, || 1_234.567_25);
+
+        assert_eq!(
+            batch.frames[0].timestamp_ms, 1_234.567_25,
+            "the fractional part must survive; truncating it puts us back at millisecond quantization"
+        );
+    }
+
+    #[test]
+    fn drain_lines_does_not_read_the_clock_for_a_line_that_is_not_a_frame() {
+        // A bare ack, a version reply and a rejection all pass through here.
+        let mut buf = String::from("\rV1010\r\u{7}");
+        let mut readings = 0;
+        let batch = drain_lines(&mut buf, || {
+            readings += 1;
+            0.0
+        });
+
+        assert!(batch.frames.is_empty());
+        assert_eq!(readings, 0, "only a parsed frame needs a timestamp");
+    }
+
+    #[test]
+    fn a_frame_clock_never_goes_backwards() {
+        let clock = FrameClock::new();
+        let readings: Vec<f64> = (0..64).map(|_| clock.now_ms()).collect();
+
+        assert!(
+            readings.windows(2).all(|w| w[1] >= w[0]),
+            "a capture stores deltas; one backwards step renders as a frame arriving before the one ahead of it"
+        );
+    }
+
+    #[test]
+    fn a_frame_clock_is_anchored_to_the_wall_clock() {
+        let clock = FrameClock::new();
+        let drift = (clock.now_ms() - now_ms() as f64).abs();
+
+        assert!(
+            drift < 1_000.0,
+            "epoch-relative, not an arbitrary monotonic origin: the CSV stores epoch seconds (drift was {drift} ms)"
+        );
+    }
+
+    #[test]
+    fn a_frame_clock_resolves_below_a_millisecond() {
+        let clock = FrameClock::new();
+        let readings: Vec<f64> = (0..1_000).map(|_| clock.now_ms()).collect();
+
+        assert!(
+            readings.iter().any(|ms| ms.fract() != 0.0),
+            "whole-millisecond readings would defeat the point of the f64"
+        );
     }
 
     #[test]
     fn drain_lines_counts_bel_as_a_rejection_not_a_frame() {
         // The adapter answers a transmit command with BEL when it rejects it.
         let mut buf = String::from("\u{7}t1A01FF\r");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert_eq!(batch.rejections, 1);
         assert_eq!(batch.frames.len(), 1);
     }
@@ -1740,7 +1886,7 @@ mod tests {
     fn drain_lines_ignores_empty_and_unparsable_lines() {
         // A bare ack, a version reply and garbage all sit in the same stream.
         let mut buf = String::from("\rV1010\rgarbage\rt1A01FF\r");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert_eq!(batch.frames.len(), 1);
         assert_eq!(batch.rejections, 0);
         assert!(buf.is_empty());
@@ -1749,7 +1895,7 @@ mod tests {
     #[test]
     fn drain_lines_returns_nothing_when_no_line_is_complete() {
         let mut buf = String::from("t1A01F");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert!(batch.frames.is_empty());
         assert_eq!(buf, "t1A01F", "the buffer is left untouched");
     }
