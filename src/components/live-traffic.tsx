@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { runCommand } from "@/commands";
 import { CaptureBar } from "@/components/capture-bar";
 import { LiveMessageCard } from "@/components/live-message-card";
+import { PerfHud } from "@/components/perf-hud";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ import {
 	type LiveMessage,
 	type LiveState,
 } from "@/lib/live-messages";
+import { perfFlags } from "@/lib/perf-flags";
 import { useCanFrames, useConnectionStatus } from "@/queries/can";
 import { useCurrentDbc } from "@/queries/dbc";
 import { useReplayStatus } from "@/queries/recording";
@@ -55,13 +57,27 @@ export function LiveTraffic({
 
 	const stateRef = useRef<LiveState>(new Map());
 	const dirtyRef = useRef(false);
+	// Cumulative, and counted unconditionally: a rate the readout only starts
+	// counting when it is switched on would be a rate of the readout.
+	const receivedRef = useRef({ frames: 0, batches: 0 });
 	const [messages, setMessages] = useState<LiveMessage[]>([]);
 
 	const dbcFile = dbc.data;
 	useCanFrames((frames) => {
 		stateRef.current = applyFrames(stateRef.current, frames, dbcFile, settings);
 		dirtyRef.current = true;
+		receivedRef.current.frames += frames.length;
+		receivedRef.current.batches += 1;
 	});
+
+	const sample = useCallback(
+		() => ({
+			ids: stateRef.current.size,
+			frames: receivedRef.current.frames,
+			batches: receivedRef.current.batches,
+		}),
+		[],
+	);
 
 	// A newly loaded DBC decodes the same ids differently, so nothing decoded
 	// under the old one should survive.
@@ -116,11 +132,14 @@ export function LiveTraffic({
 	// Rendered above the guard, not inside it: replaying a capture is how you
 	// get frames without an adapter, so the control that starts one cannot be
 	// hidden behind "not connected".
+	const hud = perfFlags.hud ? <PerfHud sample={sample} /> : null;
+
 	if (guard) {
 		return (
 			<div className="flex flex-col gap-3">
 				<CaptureBar />
 				{guard}
+				{hud}
 			</div>
 		);
 	}
@@ -152,6 +171,7 @@ export function LiveTraffic({
 					))}
 				</div>
 			)}
+			{hud}
 		</div>
 	);
 }

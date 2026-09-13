@@ -160,6 +160,23 @@ Live traffic can be written to a CSV capture, in the format the reference tool u
 - **The capture bar renders above `LiveTraffic`'s guards, not inside them.** A replay is how you get frames with no adapter attached, so the control that starts one cannot sit behind "not connected". The guard itself now asks whether *anything* is producing frames (`Boolean(status.data) || replay.running`) rather than whether an adapter is plugged in, and a test pins that a replay renders the grid with no device — without it the whole harness would show an alert instead of traffic.
 - `src/lib/capture-file.ts` holds the pure parts: `defaultCaptureFilename` (the reference tool's `capture-YYYYMMDD-HHMMSS.csv`, taking `now` as a parameter so it is testable), `formatBytes`, `SPEED_OPTIONS` and the presets.
 
+## Measuring the live tab
+
+`/visualize` grows without bound on a busy bus. The instrumentation for pinning down why is deliberately all *switchable*, so a measurement run changes nothing about the build it is measuring.
+
+| what | how |
+|---|---|
+| A profilable release build | `just build-profiling`. The Tauri CLI has **no `--profile` flag**, so the release profile is overridden through cargo's `CARGO_PROFILE_RELEASE_*` environment variables rather than by adding a `[profile.profiling]` to `Cargo.toml` that nothing could select. LTO and opt-level are left as shipped — the point is to measure the real build. Without this, `strip = true` and `panic = "abort"` mean an OOM aborts with no symbols at all. |
+| The Rust instrumentation plugin | `just dev-no-devtools`, or `CAN_TOOL_NO_DEVTOOLS=1`. `tauri_plugin_devtools` installs a global `tracing` subscriber that buffers every command and event in memory, which puts it in front of ~33 `can-frames` emits a second. **Rule it out before believing any other debug-build number.** |
+| The frontend devtools | `localStorage.setItem("can-tool:perf", '{"devtools":false}')`, then reload. Both `<ReactQueryDevtools>` and `<TanStackRouterDevtools>` are mounted unconditionally today and subscribe to the cache and the router. |
+| The readout | the same key with `{"hud":true}` — `src/components/perf-hud.tsx`, showing tracked ids, DOM nodes, `document.getAnimations().length`, frames/s, events/s and the JS heap. |
+| Process memory | `scripts/sample-rss.sh > run.csv` alongside a replay. The readout covers what the webview holds; this covers what the process holds, which is where the Rust side and the IPC queue show up. |
+| A repeatable load | Generate → a preset → replay it. Same seed, same file, same traffic every run; see "Synthetic captures". |
+
+`src/lib/perf-flags.ts` reads the flags **once at import**, not through a live store: a measurement variable that can change mid-run is worse than useless, and reading once keeps the flags out of the render path. `PerfHud` samples once a second rather than on the render flush, because counting DOM nodes at 20 Hz would make the instrument cost as much as the thing it measures. The frame and batch counters in `live-traffic.tsx` are incremented unconditionally, so a rate is never a rate of the readout being switched on.
+
+`document.getAnimations().length` is worth watching specifically: a finished `fill: "forwards"` animation stays alive on its element, so the count tracks rendered signal rows rather than running fades.
+
 ## Replay feature
 
 A recorded capture can be played back as a **virtual CAN source**, with no adapter attached: `start_replay(path, options)` / `stop_replay` / `replay_status`, driven by `src-tauri/src/replay.rs`.

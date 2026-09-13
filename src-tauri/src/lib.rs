@@ -30,7 +30,16 @@ pub fn run() {
     let mut builder = tauri::Builder::default();
     #[cfg(debug_assertions)] // only enable instrumentation in development builds
     {
-        builder = builder.plugin(tauri_plugin_devtools::init());
+        // The devtools plugin installs a global `tracing` subscriber that
+        // buffers every command and event in memory, which puts it in front of
+        // ~33 `can-frames` emits a second. That makes it the first variable to
+        // rule out in any memory measurement, so it can be switched off
+        // without editing this file:
+        //
+        //     CAN_TOOL_NO_DEVTOOLS=1 just dev
+        if std::env::var_os("CAN_TOOL_NO_DEVTOOLS").is_none() {
+            builder = builder.plugin(tauri_plugin_devtools::init());
+        }
     }
     builder
         .plugin(tauri_plugin_opener::init())

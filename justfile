@@ -13,6 +13,21 @@ build-windows-enterprise:
     pwsh -File ./scripts/fetch-webview2-runtime.ps1
     bun run tauri build --bundles nsis
 
+# A release build that can be profiled. The Tauri CLI has no --profile flag,
+# so the release profile is overridden through cargo's environment variables
+# rather than by adding a profile to Cargo.toml that nothing could select.
+# Keeps LTO and opt-level as shipped: the point is to measure the real build.
+build-profiling:
+    CARGO_PROFILE_RELEASE_DEBUG=true \
+    CARGO_PROFILE_RELEASE_STRIP=false \
+    bun run tauri build
+
+# `just dev` without the devtools plugin, which buffers every event in memory
+# and sits in front of every `can-frames` emit. The first variable to rule out
+# in any memory measurement.
+dev-no-devtools:
+    CAN_TOOL_NO_DEVTOOLS=1 bun run tauri dev
+
 clean:
     rm -rf dist node_modules/.vite
     cargo clean --manifest-path src-tauri/Cargo.toml
