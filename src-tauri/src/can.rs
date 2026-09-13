@@ -791,13 +791,13 @@ pub struct CanFrame {
 }
 
 /// The widest id each frame format can carry: 11 bits standard, 29 extended.
-const MAX_STANDARD_ID: u32 = 0x7FF;
-const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
+pub(crate) const MAX_STANDARD_ID: u32 = 0x7FF;
+pub(crate) const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
 
 /// The payload lengths CAN FD can express, indexed by DLC nibble. Above eight
 /// bytes the steps are coarse, which is why a payload has to be padded up to
 /// the next one rather than sent at its own length.
-const CAN_FD_DLC: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
+pub(crate) const CAN_FD_DLC: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
 
 /// The DLC nibble and padded byte count CAN FD uses to carry `len` bytes, or
 /// `None` if the payload is larger than a CAN FD frame.
@@ -946,7 +946,7 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
 
 /// Strict hex parse: unlike `from_str_radix`, rejects a leading `+`/`-` sign
 /// so a line like `t+101FF` is not mistaken for a frame.
-fn parse_hex(hex: &str) -> Option<u32> {
+pub(crate) fn parse_hex(hex: &str) -> Option<u32> {
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }

@@ -1,5 +1,6 @@
 mod can;
 mod dbc;
+pub mod recording;
 pub mod simulation;
 
 use can::{

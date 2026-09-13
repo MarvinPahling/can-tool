@@ -92,7 +92,7 @@ Import from the `src/commands` barrel (`index.ts`), not the individual files.
 
 ### Tauri backend structure
 
-`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 13 commands, and both `CanState` and `SimulationState` are `manage`d.
+`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 13 commands, and both `CanState` and `SimulationState` are `manage`d. `recording.rs` is the exception so far — pure capture-CSV helpers with no state and no commands yet.
 
 ## DBC feature
 
