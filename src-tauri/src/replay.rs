@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::can::{self, ensure_no_device, CanFrame, CanState};
 use crate::recording::parse_capture;
@@ -209,15 +209,24 @@ pub(crate) fn replay_status_of(state: &ReplayState) -> Result<ReplayStatus, Stri
     })
 }
 
-fn emit_batch(app: &AppHandle, pending: &mut Vec<CanFrame>, channel: &Channel) {
+fn emit_batch(
+    app: &AppHandle,
+    pending: &mut Vec<CanFrame>,
+    dropped: &mut usize,
+    channel: &Channel,
+) {
     if pending.is_empty() {
         return;
     }
-    let _ = app.emit("can-frames", &*pending);
+    // Through the reader's own helper, so a replay and an adapter cannot drift
+    // into emitting different shapes — the frontend must not be able to tell
+    // them apart.
+    can::emit_frames(app, pending, *dropped);
     channel
         .emitted
         .fetch_add(pending.len() as u64, Ordering::Relaxed);
     pending.clear();
+    *dropped = 0;
 }
 
 /// The emit loop. Batches exactly as `spawn_reader` does, through the same
@@ -232,6 +241,7 @@ fn run(app: AppHandle, frames: Vec<CanFrame>, options: ReplayOptions, channel: C
         let shift = loop_shift_ms(span, pass);
         let start = Instant::now();
         let mut pending: Vec<CanFrame> = Vec::new();
+        let mut dropped = 0usize;
         let mut last_flush = Instant::now();
 
         for (index, recorded) in frames.iter().enumerate() {
@@ -251,13 +261,17 @@ fn run(app: AppHandle, frames: Vec<CanFrame>, options: ReplayOptions, channel: C
             let mut frame = recorded.clone();
             frame.timestamp_ms += shift;
             pending.push(frame);
+            // Bounded the same way the reader is. Running as fast as possible
+            // this drops most of what it reads, which is the honest outcome —
+            // no bus could deliver that either, and the counter says so.
+            dropped += can::trim_pending(&mut pending, can::RX_PENDING_CAP);
 
             if can::should_flush(pending.len(), last_flush.elapsed()) {
-                emit_batch(&app, &mut pending, &channel);
+                emit_batch(&app, &mut pending, &mut dropped, &channel);
                 last_flush = Instant::now();
             }
         }
-        emit_batch(&app, &mut pending, &channel);
+        emit_batch(&app, &mut pending, &mut dropped, &channel);
 
         pass += 1;
         channel.loops.store(pass, Ordering::Relaxed);

@@ -1,7 +1,7 @@
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CanFrame, ProbeProgress } from "../api/can";
-import { useCanFrames, useProbeProgress } from "./can";
+import { useCanError, useCanFrames, useProbeProgress } from "./can";
 
 const { listen, unlisten, emit } = vi.hoisted(() => {
 	// Captures the handler `listen` was called with, so tests can emit into it.
@@ -45,13 +45,16 @@ describe("useCanFrames", () => {
 		expect(listen.mock.calls[0]?.[0]).toBe("can-frames");
 	});
 
-	it("hands each emitted batch to the callback", () => {
-		const onFrames = vi.fn();
-		renderHook(() => useCanFrames(onFrames));
+	it("unpacks the wire tuple into a readable batch", () => {
+		// The event carries `[frames, dropped]` because a named struct at the
+		// Rust emit site makes typegen generate a schema that does not compile.
+		// Consumers should never see that.
+		const onBatch = vi.fn();
+		renderHook(() => useCanFrames(onBatch));
 
-		emit([frame]);
+		emit([[frame], 12]);
 
-		expect(onFrames).toHaveBeenCalledWith([frame]);
+		expect(onBatch).toHaveBeenCalledWith({ frames: [frame], dropped: 12 });
 	});
 
 	it("unlistens on unmount", async () => {
@@ -72,12 +75,12 @@ describe("useCanFrames", () => {
 		});
 
 		rerender({ cb: second });
-		emit([frame]);
+		emit([[frame], 0]);
 
 		// One subscription for the lifetime of the hook, and the *latest*
 		// callback receives the batch — a re-subscribe would drop frames.
 		expect(listen).toHaveBeenCalledTimes(1);
-		expect(second).toHaveBeenCalledWith([frame]);
+		expect(second).toHaveBeenCalledWith({ frames: [frame], dropped: 0 });
 		expect(first).not.toHaveBeenCalled();
 	});
 });
@@ -129,5 +132,32 @@ describe("useProbeProgress", () => {
 		expect(listen).toHaveBeenCalledTimes(1);
 		expect(second).toHaveBeenCalledWith(progress);
 		expect(first).not.toHaveBeenCalled();
+	});
+});
+
+describe("useCanError", () => {
+	it("subscribes to the can-error event once on mount", () => {
+		renderHook(() => useCanError(() => {}));
+
+		expect(listen).toHaveBeenCalledTimes(1);
+		expect(listen.mock.calls[0]?.[0]).toBe("can-error");
+	});
+
+	it("hands the rejection count to the callback", () => {
+		const onRejections = vi.fn();
+		renderHook(() => useCanError(onRejections));
+
+		emit({ rejections: 7 });
+
+		expect(onRejections).toHaveBeenCalledWith({ rejections: 7 });
+	});
+
+	it("unlistens on unmount", async () => {
+		const { unmount } = renderHook(() => useCanError(() => {}));
+		await vi.waitFor(() => expect(listen).toHaveBeenCalled());
+
+		unmount();
+
+		await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
 	});
 });

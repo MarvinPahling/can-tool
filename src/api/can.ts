@@ -24,6 +24,9 @@ export type { CanConnectionStatus, CanDeviceInfo, TimingCandidate };
  */
 export const DATA_BITRATES = [null, 2_000_000, 5_000_000, 8_000_000] as const;
 
+/** The event name adapter transmit rejections are reported on. */
+export const CAN_ERROR_EVENT = "can-error";
+
 /**
  * One CAN frame received from the bus, as carried by the `can-frames` event.
  *
@@ -52,6 +55,43 @@ export interface CanFrame {
 	 * microseconds.
 	 */
 	timestamp_ms: number;
+}
+
+/**
+ * What a `can-frames` event actually carries: `[frames, dropped]`.
+ *
+ * A tuple because tauri-typegen generates a broken schema for a *named*
+ * struct at an `app.emit` call site — see `emit_frames` in
+ * `src-tauri/src/can.rs`. It is unpacked into `CanFrameBatch` in
+ * `useCanFrames`, so this shape stops at the boundary.
+ */
+export type CanFramesPayload = [frames: CanFrame[], dropped: number];
+
+/**
+ * One batch of received frames, and what it cost to deliver them.
+ *
+ * A bare array used to go over the wire; the count came with bounding the
+ * emit path, and it is carried rather than swallowed so a saturated page can
+ * say it is behind instead of quietly showing stale cards.
+ */
+export interface CanFrameBatch {
+	frames: CanFrame[];
+	/**
+	 * Frames the backend discarded since the previous batch because the
+	 * webview could not keep up. Zero on any healthy bus.
+	 */
+	dropped: number;
+}
+
+/**
+ * How many frames the adapter refused to transmit in the last second, as
+ * carried by the `can-error` event.
+ *
+ * Coalesced in Rust: uncoalesced this fired once per serial read, and until
+ * now nothing listened at all.
+ */
+export interface AdapterRejections {
+	rejections: number;
 }
 
 /**

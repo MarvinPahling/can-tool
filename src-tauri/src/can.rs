@@ -958,12 +958,27 @@ pub(crate) fn parse_hex(hex: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// How often the reader flushes buffered frames to the frontend, and the
-/// batch size that forces an early flush. A busy 500 kbit/s bus produces
-/// thousands of frames a second; emitting one event each would swamp the
-/// webview, so they go over in ~33 batches/s instead.
+/// How often the reader hands buffered frames to the frontend.
+///
+/// A **floor**, not a hint. `Emitter::emit` serializes the batch to JSON and
+/// evaluates a script in the webview; from a background thread that is posted
+/// through the runtime's event-loop proxy — an unbounded queue drained on the
+/// main thread. The reader never waits for the webview, so an emit rate that
+/// tracks the bus rate lets that queue grow without limit while React is busy.
+/// This is the only thing bounding it.
 const RX_FLUSH_INTERVAL: Duration = Duration::from_millis(30);
-const RX_BATCH_CAP: usize = 256;
+
+/// Most frames one event may carry. Past this the oldest are dropped and
+/// counted, which is what bounds both the buffer and the size of each event.
+///
+/// At ~33 events a second this still delivers well over 30 000 frames/s — far
+/// more than a 500 kbit/s bus can produce — so a real adapter never reaches
+/// it. A replay running as fast as it can does, which is the point: memory
+/// stays flat and the drop counter rises instead.
+pub(crate) const RX_PENDING_CAP: usize = 1024;
+
+/// How often adapter rejections are reported, at most.
+const RX_ERROR_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Guards against unbounded growth if the adapter ever streams bytes with no
 /// line terminator in sight.
@@ -1017,10 +1032,60 @@ fn drain_lines(buf: &mut String, mut now: impl FnMut() -> f64) -> RxBatch {
     batch
 }
 
-/// Whether buffered frames should go out now — either the batching window
-/// elapsed or the batch grew large enough that waiting would add latency.
+/// Whether buffered frames should go out now.
+///
+/// Only the window decides. A buffer-size trigger used to short-circuit it,
+/// which meant the batching promised a bounded event rate and did not deliver
+/// one; the size limit is now `trim_pending`'s job instead, where overflow
+/// costs frames rather than events.
 pub(crate) fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
-    pending > 0 && (pending >= RX_BATCH_CAP || since_last_flush >= RX_FLUSH_INTERVAL)
+    pending > 0 && since_last_flush >= RX_FLUSH_INTERVAL
+}
+
+/// Drops the oldest frames so the buffer cannot outgrow `cap`, returning how
+/// many went.
+///
+/// Oldest rather than newest: on a bus this saturated the newest frame is the
+/// one worth showing, and a dropped-frame counter beats a card that has
+/// quietly stopped moving. The recorder sees the frames first and keeps all of
+/// them, so a capture is unaffected — the recording is ground truth, the event
+/// stream is best-effort.
+pub(crate) fn trim_pending(pending: &mut Vec<CanFrame>, cap: usize) -> usize {
+    let excess = pending.len().saturating_sub(cap);
+    if excess > 0 {
+        pending.drain(..excess);
+    }
+    excess
+}
+
+/// Whether a rejection notice is due. Coalesced, because an adapter refusing
+/// every frame used to produce one event per read for a listener that did not
+/// exist.
+fn should_report_rejections(pending: usize, since_last_report: Duration) -> bool {
+    pending > 0 && since_last_report >= RX_ERROR_INTERVAL
+}
+
+/// How many frames an adapter refused to transmit in the last window.
+#[derive(Serialize, Clone)]
+struct AdapterRejections {
+    rejections: usize,
+}
+
+/// Emits one `can-frames` event as `(frames, dropped)`.
+///
+/// Shared by the reader and the replay engine so the two cannot drift into
+/// emitting different shapes.
+///
+/// **A tuple rather than a named struct, and that is not a style choice.**
+/// tauri-typegen recognizes a named struct at an `app.emit` call site and
+/// generates a Zod schema for it — and a `FrameBatch { frames: Vec<CanFrame> }`
+/// produces a schema referencing a `CanFrameSchema` that typegen never emits,
+/// because `CanFrame` appears in no command signature. The generated
+/// `types.ts` then does not compile, and it must not be hand-edited. A tuple
+/// has no name for typegen to pick up. The readable shape is restored at the
+/// frontend boundary, in `useCanFrames`.
+pub(crate) fn emit_frames(app: &AppHandle, frames: &[CanFrame], dropped: usize) {
+    let _ = app.emit("can-frames", (frames, dropped));
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -1077,7 +1142,10 @@ fn spawn_reader(
         let mut raw = [0u8; 1024];
         let mut buf = String::new();
         let mut pending: Vec<CanFrame> = Vec::new();
+        let mut dropped = 0usize;
+        let mut rejections = 0usize;
         let mut last_flush = Instant::now();
+        let mut last_report = Instant::now();
         let clock = FrameClock::new();
         // Taken from the managed state rather than threaded down through
         // `open_connection`, and cloned once rather than looked up per batch.
@@ -1092,15 +1160,14 @@ fn spawn_reader(
                 Ok(n) => {
                     buf.push_str(&String::from_utf8_lossy(&raw[..n]));
                     let batch = drain_lines(&mut buf, || clock.now_ms());
-                    if batch.rejections > 0 {
-                        let _ = app.emit("can-error", "Adapter rejected a frame");
-                    }
+                    rejections += batch.rejections;
                     // Recorded before the emit, and unconditionally: the
                     // capture is ground truth, the event stream is
-                    // best-effort. A recorder that only saw what the webview
-                    // saw would be useless for debugging the webview.
+                    // best-effort. Now that the emit path can drop frames,
+                    // the recording is also the only complete copy.
                     recorder.write_frames(&batch.frames);
                     pending.extend(batch.frames);
+                    dropped += trim_pending(&mut pending, RX_PENDING_CAP);
                 }
                 // Timeouts are how an idle bus looks — keep waiting.
                 Err(e) if e.kind() == ErrorKind::TimedOut => {}
@@ -1108,9 +1175,16 @@ fn spawn_reader(
                 Err(_) => break,
             }
 
+            if should_report_rejections(rejections, last_report.elapsed()) {
+                let _ = app.emit("can-error", AdapterRejections { rejections });
+                rejections = 0;
+                last_report = Instant::now();
+            }
+
             if should_flush(pending.len(), last_flush.elapsed()) {
-                let _ = app.emit("can-frames", &pending);
+                emit_frames(&app, &pending, dropped);
                 pending.clear();
+                dropped = 0;
                 last_flush = Instant::now();
             }
         }
@@ -1261,6 +1335,18 @@ mod tests {
             bitrate: 500_000,
             data_bitrate: None,
             read_only,
+        }
+    }
+
+    fn rx_frame(id: u32) -> CanFrame {
+        CanFrame {
+            id,
+            extended: false,
+            fd: false,
+            bitrate_switch: false,
+            remote: false,
+            data: vec![0],
+            timestamp_ms: 0.0,
         }
     }
 
@@ -1934,14 +2020,56 @@ mod tests {
     }
 
     #[test]
-    fn should_flush_batches_until_the_interval_or_the_cap() {
+    fn should_flush_waits_for_the_interval() {
         // Nothing buffered: never flush, however long it has been.
         assert!(!should_flush(0, Duration::from_secs(1)));
         // Buffered but still inside the window: keep batching.
         assert!(!should_flush(1, Duration::from_millis(5)));
         // The interval elapsed.
         assert!(should_flush(1, RX_FLUSH_INTERVAL));
-        // The cap is reached before the interval, so a burst flushes early.
-        assert!(should_flush(RX_BATCH_CAP, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn a_full_buffer_no_longer_bypasses_the_flush_interval() {
+        // The old rule flushed early once the buffer reached a cap, so the
+        // "~33 events/s" the batching promises held only on a quiet bus: on a
+        // loud one the emit rate was bounded by nothing but how fast
+        // `port.read` returned, and every event is a script evaluated on the
+        // main thread through an unbounded queue.
+        assert!(
+            !should_flush(RX_PENDING_CAP * 10, Duration::from_millis(0)),
+            "the interval is a floor, not a hint"
+        );
+    }
+
+    #[test]
+    fn trim_pending_leaves_a_buffer_inside_the_cap_alone() {
+        let mut pending = vec![rx_frame(1), rx_frame(2)];
+        assert_eq!(trim_pending(&mut pending, 4), 0);
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn trim_pending_drops_the_oldest_frames_and_counts_them() {
+        // Oldest rather than newest: on a bus this saturated the newest frame
+        // is the one worth showing, and a dropped-frame counter beats a card
+        // that has quietly stopped moving.
+        let mut pending = vec![rx_frame(1), rx_frame(2), rx_frame(3), rx_frame(4)];
+
+        assert_eq!(trim_pending(&mut pending, 2), 2);
+        assert_eq!(
+            pending.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![3, 4],
+            "the survivors must be the newest"
+        );
+    }
+
+    #[test]
+    fn should_report_rejections_coalesces_to_one_per_window() {
+        // Emitted once per read chunk, this flooded the main thread with
+        // events for a listener that did not exist.
+        assert!(!should_report_rejections(0, Duration::from_secs(10)));
+        assert!(!should_report_rejections(5, Duration::from_millis(10)));
+        assert!(should_report_rejections(1, RX_ERROR_INTERVAL));
     }
 }

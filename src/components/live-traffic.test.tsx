@@ -10,20 +10,32 @@ const {
 	useConnectionStatus,
 	useCurrentDbc,
 	useReplayStatus,
+	useCanError,
+	emitRejections,
 } = vi.hoisted(() => {
-	let handler: ((frames: unknown[]) => void) | undefined;
+	let handler: ((batch: unknown) => void) | undefined;
+	let errorHandler: ((event: unknown) => void) | undefined;
 	return {
-		useCanFrames: vi.fn((cb: (frames: unknown[]) => void) => {
+		useCanFrames: vi.fn((cb: (batch: unknown) => void) => {
 			handler = cb;
+		}),
+		useCanError: vi.fn((cb: (event: unknown) => void) => {
+			errorHandler = cb;
 		}),
 		useConnectionStatus: vi.fn(),
 		useCurrentDbc: vi.fn(),
 		useReplayStatus: vi.fn(),
-		emitFrames: (frames: CanFrame[]) => handler?.(frames),
+		emitFrames: (frames: CanFrame[], dropped = 0) =>
+			handler?.({ frames, dropped }),
+		emitRejections: (rejections: number) => errorHandler?.({ rejections }),
 	};
 });
 
-vi.mock("@/queries/can", () => ({ useCanFrames, useConnectionStatus }));
+vi.mock("@/queries/can", () => ({
+	useCanError,
+	useCanFrames,
+	useConnectionStatus,
+}));
 vi.mock("@/queries/dbc", () => ({ useCurrentDbc }));
 vi.mock("@/queries/recording", () => ({ useReplayStatus }));
 // The capture controls have their own test; here they are only in the way.
@@ -58,9 +70,9 @@ function frame(overrides: Partial<CanFrame> = {}): CanFrame {
 }
 
 /** Pushes frames in, then lets the render-flush interval fire. */
-function deliver(frames: CanFrame[]) {
+function deliver(frames: CanFrame[], dropped = 0) {
 	act(() => {
-		emitFrames(frames);
+		emitFrames(frames, dropped);
 		vi.advanceTimersByTime(200);
 	});
 }
@@ -168,5 +180,36 @@ describe("LiveTraffic", () => {
 		deliver([frame({ id: 0x777, data: [1] })]);
 
 		expect(screen.getByText("Not in DBC")).toBeInTheDocument();
+	});
+
+	it("says when the backend had to drop frames", () => {
+		// Silently showing stale cards would be worse than the drop: the page
+		// has to be able to admit it is behind.
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()], 1_500);
+
+		expect(screen.getByText(/1,500 dropped/)).toBeInTheDocument();
+	});
+
+	it("does not mention drops on a healthy bus", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(screen.queryByText(/dropped/)).not.toBeInTheDocument();
+	});
+
+	it("surfaces adapter transmit rejections", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		act(() => {
+			emitRejections(3);
+			emitRejections(4);
+		});
+
+		expect(
+			screen.getByText(/7 transmitted frames were refused/),
+		).toBeInTheDocument();
 	});
 });

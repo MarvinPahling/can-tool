@@ -1,9 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
-import type { CanFrame, ProbeProgress } from "../api/can";
+import type {
+	AdapterRejections,
+	CanFrameBatch,
+	CanFramesPayload,
+	ProbeProgress,
+} from "../api/can";
 import {
 	autodetectBitrate,
+	CAN_ERROR_EVENT,
 	canConnectionStatus,
 	connectCanDevice,
 	disconnectCanDevice,
@@ -119,23 +125,57 @@ export function useGenerateChecksum() {
  * and pushing every batch through `setState` would undo that. Consumers keep
  * their own accumulator and flush on their own schedule.
  */
-export function useCanFrames(onFrames: (frames: CanFrame[]) => void) {
+export function useCanFrames(onBatch: (batch: CanFrameBatch) => void) {
 	// The callback lives in a ref so a new identity each render does not tear
 	// down and re-register the listener, which would drop frames in the gap.
-	const handler = useRef(onFrames);
+	const handler = useRef(onBatch);
 	useEffect(() => {
-		handler.current = onFrames;
+		handler.current = onBatch;
 	});
 
 	useEffect(() => {
 		let cancelled = false;
 		let unlisten: (() => void) | undefined;
 
-		listen<CanFrame[]>("can-frames", (event) => {
-			handler.current(event.payload);
+		listen<CanFramesPayload>("can-frames", (event) => {
+			// The wire shape is a tuple; consumers get the readable one.
+			const [frames, dropped] = event.payload;
+			handler.current({ frames, dropped });
 		}).then((fn) => {
 			// `listen` resolves asynchronously; if the effect was already torn
 			// down by then, unlisten immediately rather than leaking it.
+			if (cancelled) fn();
+			else unlisten = fn;
+		});
+
+		return () => {
+			cancelled = true;
+			unlisten?.();
+		};
+	}, []);
+}
+
+/**
+ * Subscribes to adapter transmit rejections.
+ *
+ * The backend has emitted these since the reader thread was written and
+ * nothing has ever listened, so every one was a script evaluated on the main
+ * thread for nobody. They are coalesced to one a second now, and this is the
+ * first consumer.
+ */
+export function useCanError(onRejections: (event: AdapterRejections) => void) {
+	const handler = useRef(onRejections);
+	useEffect(() => {
+		handler.current = onRejections;
+	});
+
+	useEffect(() => {
+		let cancelled = false;
+		let unlisten: (() => void) | undefined;
+
+		listen<AdapterRejections>(CAN_ERROR_EVENT, (event) => {
+			handler.current(event.payload);
+		}).then((fn) => {
 			if (cancelled) fn();
 			else unlisten = fn;
 		});

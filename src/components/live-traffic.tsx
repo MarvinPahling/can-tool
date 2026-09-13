@@ -14,7 +14,7 @@ import {
 	type LiveState,
 } from "@/lib/live-messages";
 import { perfFlags } from "@/lib/perf-flags";
-import { useCanFrames, useConnectionStatus } from "@/queries/can";
+import { useCanError, useCanFrames, useConnectionStatus } from "@/queries/can";
 import { useCurrentDbc } from "@/queries/dbc";
 import { useReplayStatus } from "@/queries/recording";
 
@@ -60,15 +60,28 @@ export function LiveTraffic({
 	// Cumulative, and counted unconditionally: a rate the readout only starts
 	// counting when it is switched on would be a rate of the readout.
 	const receivedRef = useRef({ frames: 0, batches: 0 });
+	const droppedRef = useRef(0);
 	const [messages, setMessages] = useState<LiveMessage[]>([]);
+	const [dropped, setDropped] = useState(0);
+	const [rejections, setRejections] = useState(0);
 
 	const dbcFile = dbc.data;
-	useCanFrames((frames) => {
-		stateRef.current = applyFrames(stateRef.current, frames, dbcFile, settings);
+	useCanFrames((batch) => {
+		stateRef.current = applyFrames(
+			stateRef.current,
+			batch.frames,
+			dbcFile,
+			settings,
+		);
 		dirtyRef.current = true;
-		receivedRef.current.frames += frames.length;
+		receivedRef.current.frames += batch.frames.length;
 		receivedRef.current.batches += 1;
+		droppedRef.current += batch.dropped;
 	});
+
+	// The adapter refusing a transmit has been reported since the reader thread
+	// was written, with nothing listening. This is the first consumer.
+	useCanError((event) => setRejections((total) => total + event.rejections));
 
 	const sample = useCallback(
 		() => ({
@@ -92,6 +105,7 @@ export function LiveTraffic({
 			if (!dirtyRef.current) return;
 			dirtyRef.current = false;
 			setMessages([...stateRef.current.values()].sort((a, b) => a.id - b.id));
+			setDropped(droppedRef.current);
 		}, RENDER_INTERVAL_MS);
 		return () => clearInterval(id);
 	}, []);
@@ -134,10 +148,21 @@ export function LiveTraffic({
 	// hidden behind "not connected".
 	const hud = perfFlags.hud ? <PerfHud sample={sample} /> : null;
 
+	const rejectionAlert =
+		rejections > 0 ? (
+			<Alert variant="destructive">
+				<AlertTitle>Adapter rejected frames</AlertTitle>
+				<AlertDescription>
+					{`${rejections.toLocaleString()} transmitted frames were refused. The channel may be closed, bus-off, or in read-only mode.`}
+				</AlertDescription>
+			</Alert>
+		) : null;
+
 	if (guard) {
 		return (
 			<div className="flex flex-col gap-3">
 				<CaptureBar />
+				{rejectionAlert}
 				{guard}
 				{hud}
 			</div>
@@ -147,6 +172,7 @@ export function LiveTraffic({
 	return (
 		<div className="flex flex-col gap-3">
 			<CaptureBar />
+			{rejectionAlert}
 			<div className="flex items-center gap-2">
 				<Input
 					value={filter}
@@ -157,6 +183,14 @@ export function LiveTraffic({
 				<span className="text-xs text-muted-foreground">
 					{`${messages.length} messages`}
 				</span>
+				{dropped > 0 && (
+					<span
+						className="text-xs text-destructive"
+						title="The page could not keep up, so the backend discarded the oldest frames rather than letting the event queue grow"
+					>
+						{`${dropped.toLocaleString()} dropped`}
+					</span>
+				)}
 				<div className="ml-auto">
 					<VisualizeSettingsPopover />
 				</div>
