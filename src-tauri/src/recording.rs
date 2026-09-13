@@ -219,6 +219,53 @@ pub fn row_to_frame(line: &str, line_no: usize) -> Result<Option<CanFrame>, Stri
     }))
 }
 
+/// A capture read into memory.
+#[derive(Debug)]
+pub struct Capture {
+    pub frames: Vec<CanFrame>,
+    /// Well-formed rows that carried no frame we can represent — today only
+    /// error frames. Reported rather than hidden.
+    pub skipped: usize,
+}
+
+/// Reads a whole capture, or explains which line stopped it.
+///
+/// All-or-nothing on purpose. A replay that dies a third of the way through a
+/// file is worse than one that never starts, so every row is parsed before the
+/// caller is given anything — the posture `validate_entries` takes in
+/// `simulation.rs` for the same reason.
+///
+/// `max_frames` is a memory bound, not a format rule: the frames are held in
+/// RAM for the whole replay, so opening the wrong multi-gigabyte file has to
+/// be a message rather than an out-of-memory abort. A recording may legally be
+/// larger than anything that can be replayed in one go.
+pub fn parse_capture(text: &str, max_frames: usize) -> Result<Capture, String> {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or("The capture file is empty")?;
+    check_header(header)?;
+
+    let mut frames = Vec::new();
+    let mut skipped = 0;
+    for (index, line) in lines.enumerate() {
+        // Trailing blank lines are what a CRLF-terminated file looks like to
+        // some editors; they are not a malformed row.
+        if line.trim().is_empty() {
+            continue;
+        }
+        if frames.len() >= max_frames {
+            return Err(format!(
+                "The capture holds more than {max_frames} frames, which is the most that can be replayed at once. Record a shorter one or trim this one."
+            ));
+        }
+        match row_to_frame(line, index + 2)? {
+            Some(frame) => frames.push(frame),
+            None => skipped += 1,
+        }
+    }
+
+    Ok(Capture { frames, skipped })
+}
+
 // ---------------------------------------------------------------------------
 // The recorder
 // ---------------------------------------------------------------------------
@@ -729,6 +776,62 @@ mod tests {
     fn a_timestamp_survives_the_seconds_conversion() {
         let parsed = row_to_frame(REFERENCE_ROW, 1).unwrap().unwrap();
         assert_eq!(parsed.timestamp_ms, 1_787_839_203_108.521);
+    }
+
+    // ---- loading a capture ----
+
+    #[test]
+    fn parse_capture_reads_the_reference_file() {
+        let capture =
+            parse_capture(include_str!("../fixtures/reference-capture.csv"), 1_000).unwrap();
+        assert_eq!(capture.frames.len(), 37);
+        assert_eq!(capture.skipped, 0);
+        assert_eq!(capture.frames[0].id, 0xA5);
+    }
+
+    #[test]
+    fn parse_capture_rejects_a_file_without_the_header() {
+        assert!(parse_capture("1.0,0x1A0,0,0,0,0,0,0,\r\n", 1_000).is_err());
+    }
+
+    #[test]
+    fn parse_capture_rejects_the_whole_file_for_one_bad_row() {
+        let text = format!("{CAPTURE_HEADER}\r\n1.0,0x1A0,0,0,0,0,0,0,\r\nrubbish\r\n");
+        let err = parse_capture(&text, 1_000).unwrap_err();
+        assert!(err.contains('3'), "the bad row is line 3, got: {err}");
+    }
+
+    #[test]
+    fn parse_capture_counts_rows_it_cannot_represent_rather_than_failing() {
+        let text =
+            format!("{CAPTURE_HEADER}\r\n1.0,0x1A0,0,0,0,0,0,0,\r\n1.1,0x1A0,0,0,0,1,0,0,\r\n");
+        let capture = parse_capture(&text, 1_000).unwrap();
+        assert_eq!(capture.frames.len(), 1);
+        assert_eq!(capture.skipped, 1, "the error frame is counted, not fatal");
+    }
+
+    #[test]
+    fn parse_capture_ignores_a_trailing_blank_line() {
+        let text = format!("{CAPTURE_HEADER}\r\n1.0,0x1A0,0,0,0,0,0,0,\r\n\r\n");
+        assert_eq!(parse_capture(&text, 1_000).unwrap().frames.len(), 1);
+    }
+
+    #[test]
+    fn parse_capture_refuses_a_file_beyond_the_frame_cap() {
+        let mut text = format!("{CAPTURE_HEADER}\r\n");
+        for _ in 0..5 {
+            text.push_str("1.0,0x1A0,0,0,0,0,0,0,\r\n");
+        }
+        let err = parse_capture(&text, 3).unwrap_err();
+        assert!(
+            err.contains('3'),
+            "the message must say what the limit is, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_capture_rejects_an_empty_file() {
+        assert!(parse_capture("", 1_000).is_err());
     }
 
     // ---- the recorder ----

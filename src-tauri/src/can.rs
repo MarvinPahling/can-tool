@@ -348,6 +348,9 @@ pub fn connect_can_device(
     // still writing to the connection about to be replaced. Stopping first is
     // also what fixes the lock order as `SimulationState` before `CanState`.
     crate::simulation::stop_running(&sim_state)?;
+    // A replay is already emitting `can-frames`; a second source would make
+    // the page show two buses interleaved.
+    crate::replay::ensure_not_replaying(&app.state::<crate::replay::ReplayState>())?;
 
     // Racy by nature — the sweep could claim the flag right after this check —
     // but the loser then just fails to open the port, with a clearer message
@@ -578,6 +581,7 @@ pub async fn autodetect_bitrate(
         // interleaved into that sequence would corrupt it and poison the
         // frame counts the scoring is built on.
         crate::simulation::stop_running(&app.state::<SimulationState>())?;
+        crate::replay::ensure_not_replaying(&app.state::<crate::replay::ReplayState>())?;
         let state = app.state::<CanState>();
         run_bitrate_sweep(&app, &state, &port_name, read_only)
     })
@@ -1015,7 +1019,7 @@ fn drain_lines(buf: &mut String, mut now: impl FnMut() -> f64) -> RxBatch {
 
 /// Whether buffered frames should go out now — either the batching window
 /// elapsed or the batch grew large enough that waiting would add latency.
-fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
+pub(crate) fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
     pending > 0 && (pending >= RX_BATCH_CAP || since_last_flush >= RX_FLUSH_INTERVAL)
 }
 
@@ -1129,6 +1133,24 @@ pub(crate) fn write_frame(
         port,
         &format_slcan_frame(id, extended, fd, bitrate_switch, data)?,
     )
+}
+
+/// Refuses when a device is connected.
+///
+/// A replay and a live adapter both emit `can-frames`, and two sources at once
+/// would make every frame count and every memory measurement meaningless. The
+/// mirror of this guard lives in `replay::ensure_not_replaying`.
+pub(crate) fn ensure_no_device(state: &CanState) -> Result<(), String> {
+    let guard = state
+        .connection
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
+    if guard.is_some() {
+        return Err(
+            "A CAN device is connected; disconnect it before replaying a capture".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Hands the simulation scheduler its own write handle to the open port,

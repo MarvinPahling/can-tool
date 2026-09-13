@@ -92,7 +92,7 @@ Import from the `src/commands` barrel (`index.ts`), not the individual files.
 
 ### Tauri backend structure
 
-`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 16 commands, and `CanState`, `SimulationState` and `RecordingState` are all `manage`d.
+`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`, `replay.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 19 commands, and `CanState`, `SimulationState`, `RecordingState` and `ReplayState` are all `manage`d.
 
 ## DBC feature
 
@@ -149,6 +149,19 @@ Live traffic can be written to a CSV capture, in the format the reference tool u
 - **The counters live outside the sink's mutex.** `recording_status` is polled from the main thread and the reader holds that mutex across a buffered write — the same hazard `can.rs` documents for the serial port. Reading the status takes no lock the reader ever holds while writing.
 - `write_frames` returns nothing: the reader has nowhere to put an error, and a failing recording must not take the live view down with it. A write failure or a `max_frames`/`max_bytes` ceiling flushes, closes the sink and surfaces through `stopped_reason`, so a stopped capture is still a readable one. Ceilings are checked per frame, not per batch, so a limit stops the recording exactly where it says it does.
 - The reader takes its handle from the managed state via the `AppHandle` rather than having it threaded down through `open_connection`, and records **before** the `can-frames` emit: the capture is ground truth, the event stream is best-effort.
+
+## Replay feature
+
+A recorded capture can be played back as a **virtual CAN source**, with no adapter attached: `start_replay(path, options)` / `stop_replay` / `replay_status`, driven by `src-tauri/src/replay.rs`.
+
+- **It emits the same `can-frames` events the slcan reader does**, on the same cadence, through the same `should_flush`. That is the whole point rather than an implementation detail: the leading suspect for the live view's memory growth is the IPC hop itself, so a replay that fed the decoder from JavaScript would skip the layer under investigation and produce a reassuring, meaningless number. The frontend cannot tell a replay from an adapter.
+- The timing arithmetic is pure and separated from the thread, as in `simulation.rs`: `schedule_offsets` (per-frame offsets from the start of a pass, scaled by speed, clamped non-decreasing because a hand-edited capture can go backwards and `Instant` has no past), `capture_span_ms`, `loop_shift_ms`. The wait itself reuses `simulation::wait_until` — a replay is the same park/poll/spin ladder against a single known deadline, so `stop_running`'s `unpark` is what makes a stop prompt rather than one capture-gap late.
+- **`speed: None` is as-fast-as-possible**, a deliberate mode rather than a missing value: it is how the frontend gets pushed past anything a real bus could deliver, on demand and reproducibly.
+- **Repeating shifts every timestamp by `loop_shift_ms`.** Without it a second pass replays the same `timestamp_ms`, and since the live view keys its fade on `changedAt` — which *is* that timestamp — the page would look frozen while frames were still arriving.
+- Speed scales the *wait*, not the timestamps: the frames are the recorded frames, delivered faster.
+- **One source of `can-frames` at a time.** `start_replay` refuses while a device is connected (`can::ensure_no_device`) and `connect_can_device`/`autodetect_bitrate` refuse while a replay runs (`replay::ensure_not_replaying`). Two sources interleaved would make every frame count and every memory measurement meaningless. `start_replay` holds neither lock while checking the other, so nothing nests and the `SimulationState`-before-`CanState` rule is untouched.
+- The file is parsed **atomically** before any state is touched (`recording::parse_capture`): one bad row fails the start with its line number and nothing emitted, the posture `validate_entries` takes. `MAX_REPLAY_FRAMES` is a memory bound rather than a format rule — frames stay in RAM for the whole run — and is deliberately lower than the recorder's own ceiling, since a recording is for analysis as well as replay.
+- Note typegen now emits an `onCanFrames` helper into `src/generated/events.ts` typed `payload: unknown`, because it sees the `app.emit` call site here. It is as unusable as the rest of that file; `src/api/can.ts` keeps the hand-written `CanFrame`.
 
 ## Simulation feature
 
