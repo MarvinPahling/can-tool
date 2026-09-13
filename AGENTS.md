@@ -150,6 +150,13 @@ Live traffic can be written to a CSV capture, in the format the reference tool u
 - `write_frames` returns nothing: the reader has nowhere to put an error, and a failing recording must not take the live view down with it. A write failure or a `max_frames`/`max_bytes` ceiling flushes, closes the sink and surfaces through `stopped_reason`, so a stopped capture is still a readable one. Ceilings are checked per frame, not per batch, so a limit stops the recording exactly where it says it does.
 - The reader takes its handle from the managed state via the `AppHandle` rather than having it threaded down through `open_connection`, and records **before** the `can-frames` emit: the capture is ground truth, the event stream is best-effort.
 
+**Frontend (shared by recording, replay and generation)**
+
+- `src/api/recording.ts` — the hand-written boundary for all three. `RecordingStatus`, `ReplayStatus` and `RecordingSummary` are **hand-declared, not re-exported** from `src/generated/types.ts`, for the reason written up on `SimulationStatus`: typegen models a Rust `Option<T>` as `T | undefined` while serde sends `null`, and a command's *return* never runs through the generated Zod schema. Both statuses normalize with `?? null` so consumers see one shape.
+- The same mismatch bites in the other direction for **params**, which *are* Zod-parsed: `ReplayOptionsSchema.speed` and `CaptureSpecSchema.from_dbc` are `.optional()` and `safeParse` rejects an explicit `null`. So `startReplay` and `generateCapture` **omit the key** rather than sending null — the trap `connectCanDevice` already hits with `dataBitrate`. The app-facing types keep `speed: number | null` and `from_dbc: DbcFile | null`, since one shape is easier to hold in a form than an optional.
+- `defaultCaptureSpec` defaults `churn` above zero deliberately; a static capture measures nothing worth measuring.
+- `src/queries/recording.ts` — both statuses are **polled** at 500 ms like `useSimulationStatus`, not pushed. The two events that might seem to warrant pushing (a recording hitting a ceiling, a replay finishing) already show up in the next poll as `recording: false` plus a `stopped_reason`. Mutations invalidate `onSettled`, not `onSuccess`: a rejected start leaves the cached status stale either way. `useGenerateCapture` invalidates nothing — writing a file touches no state the statuses report.
+
 ## Replay feature
 
 A recorded capture can be played back as a **virtual CAN source**, with no adapter attached: `start_replay(path, options)` / `stop_replay` / `replay_status`, driven by `src-tauri/src/replay.rs`.
