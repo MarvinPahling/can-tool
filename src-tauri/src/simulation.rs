@@ -259,7 +259,7 @@ pub fn validate_entries(
 /// The coarse phase parks rather than sleeps so `stop_running`'s `unpark` cuts
 /// it short; the finer two re-check `stop` on every slice. Between them, a stop
 /// is never held up by the longest cycle in the set.
-fn wait_until(deadline: Instant, stop: &AtomicBool) {
+pub(crate) fn wait_until(deadline: Instant, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         // Saturating: by the time this is read the deadline may already have
         // passed, and a negative `Instant` difference panics.

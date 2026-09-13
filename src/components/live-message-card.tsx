@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { LiveSignalValue } from "@/components/live-signal-value";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -11,8 +12,14 @@ import type { VisualizeSettings } from "@/lib/visualize-settings";
  *
  * Ids absent from the loaded DBC still get a card — unknown traffic is often
  * the thing you opened this page to find — just with no signals to decode.
+ *
+ * Memoized. Every flush hands the grid a fresh array, so without this every
+ * card on screen re-renders twenty times a second whether or not a frame
+ * arrived for it. `applyFrames` only builds a new `LiveMessage` for an id that
+ * actually received one, which is what makes the default shallow comparison
+ * enough.
  */
-export function LiveMessageCard({
+export const LiveMessageCard = memo(function LiveMessageCard({
 	live,
 	settings,
 }: {
@@ -73,4 +80,4 @@ export function LiveMessageCard({
 			</CardContent>
 		</Card>
 	);
-}
+});

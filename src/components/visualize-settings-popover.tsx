@@ -1,5 +1,6 @@
 import { Settings2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
 	Popover,
@@ -104,6 +105,43 @@ export function VisualizeSettingsPopover() {
 						/>
 						<p className="text-[10px] text-muted-foreground">
 							As a percentage of each signal's full range.
+						</p>
+					</div>
+
+					<Separator />
+
+					<div className="flex flex-col gap-2">
+						<div className="flex items-center justify-between gap-2">
+							<Label htmlFor="max-live-ids" className="leading-tight">
+								Limit cards on screen
+							</Label>
+							<Switch
+								id="max-live-ids"
+								checked={settings.maxLiveIds !== null}
+								onCheckedChange={(checked) =>
+									setSettings({ maxLiveIds: checked ? 512 : null })
+								}
+							/>
+						</div>
+						{settings.maxLiveIds !== null && (
+							<Input
+								type="number"
+								min={1}
+								aria-label="Maximum ids"
+								value={settings.maxLiveIds}
+								onChange={(event) => {
+									const next = Number(event.target.value);
+									if (Number.isFinite(next) && next > 0) {
+										setSettings({ maxLiveIds: next });
+									}
+								}}
+							/>
+						)}
+						<p className="text-[10px] text-muted-foreground">
+							Off by default. A bus that gives every sender its own id has no
+							natural limit, and each one costs a card. Turning this on hides
+							the least recently seen ids — real traffic you will stop seeing,
+							which is why it is a choice rather than a default.
 						</p>
 					</div>
 

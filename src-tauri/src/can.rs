@@ -10,6 +10,7 @@ use serialport::{ClearBuffer, SerialPort, SerialPortType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
+use crate::recording::RecordingState;
 use crate::simulation::SimulationState;
 
 /// USB identity of a CANable 2.0 running its default slcan firmware.
@@ -123,18 +124,61 @@ struct CanConnection {
     status: CanConnectionStatus,
     /// Signals the reader thread to exit; see `stop_reader`.
     stop: Arc<AtomicBool>,
+    /// Set by the reader when the port stops answering — unplugged, or closed
+    /// underneath us. Shared rather than reported through `CanState`, because
+    /// the reader must never take that mutex: `stop_reader` is called *while
+    /// holding it*, so a reader that wanted it during teardown would deadlock.
+    lost: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
 }
 
+/// Signals a reader thread and waits for it to exit, so a reconnect can never
+/// leave a second thread reading the same port.
+///
+/// Free-standing and taking the two fields it needs, so it can be tested
+/// without a serial port. Taking the handle is what makes it idempotent —
+/// `Drop` runs it again after `disconnect_can_device` already has.
+fn stop_reader(stop: &Arc<AtomicBool>, reader: &mut Option<JoinHandle<()>>) {
+    stop.store(true, Ordering::Relaxed);
+    if let Some(reader) = reader.take() {
+        // `unpark` is not needed: the reader blocks in `read`, bounded by
+        // `RX_READ_TIMEOUT`, so the join is short by construction.
+        let _ = reader.join();
+    }
+}
+
+/// Whether the reader has reported its port gone.
+fn connection_lost(lost: &Arc<AtomicBool>) -> bool {
+    lost.load(Ordering::Relaxed)
+}
+
+/// The connection, if there is one still answering.
+///
+/// A `CanConnection` whose reader has died is not one. Every caller that asks
+/// "is a device attached?" must go through here, or they disagree: the status
+/// would report disconnected after an unplug while `ensure_no_device` still
+/// refused to start a replay, leaving no way forward without a restart.
+fn active(guard: &Option<CanConnection>) -> Option<&CanConnection> {
+    guard.as_ref().filter(|c| !connection_lost(&c.lost))
+}
+
 impl CanConnection {
-    /// Stops the reader thread and waits for it to exit, so a reconnect can
-    /// never leave a second thread reading the same port. The join costs at
-    /// most one read timeout.
     fn stop_reader(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        stop_reader(&self.stop, &mut self.reader);
+    }
+}
+
+/// The leak this closes: three paths dropped a `CanConnection` without
+/// stopping its thread — the sweep's reconnect overwriting the slot, and a
+/// poisoned-lock `?` after the thread was already spawned. A leaked reader
+/// owns a `try_clone`d descriptor, so closing the connection's own port does
+/// not end it; it runs until the process does, keeps emitting `can-frames`
+/// into a second interleaved stream, and holds a cloned `AppHandle` that pins
+/// the whole `AppManager` — every managed state and every window. Doing this
+/// in `Drop` closes all three by construction rather than by remembering.
+impl Drop for CanConnection {
+    fn drop(&mut self) {
+        self.stop_reader();
     }
 }
 
@@ -314,14 +358,22 @@ fn open_connection(
     configure_channel(&mut port, candidate, read_only)?;
 
     // The reader gets its own handle so it never contends with the writer.
-    let rx_port = port
+    let mut rx_port = port
         .try_clone()
         .map_err(|e| format!("Failed to open a read handle on {port_name}: {e}"))?;
 
+    // And its own, much shorter read timeout. The writer keeps
+    // `SERIAL_TIMEOUT`, where a blocking write genuinely needs the headroom;
+    // on this handle it only decides how long a stop waits for the loop to
+    // come back around, and how long a part-filled batch sits on an idle bus.
+    let _ = rx_port.set_timeout(RX_READ_TIMEOUT);
+
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
+    let lost = Arc::new(AtomicBool::new(false));
+    let reader = spawn_reader(app, rx_port, Arc::clone(&stop), Arc::clone(&lost));
     Ok(CanConnection {
         port,
+        lost,
         status: CanConnectionStatus {
             port_name: port_name.to_string(),
             bitrate: candidate.bitrate,
@@ -347,6 +399,9 @@ pub fn connect_can_device(
     // still writing to the connection about to be replaced. Stopping first is
     // also what fixes the lock order as `SimulationState` before `CanState`.
     crate::simulation::stop_running(&sim_state)?;
+    // A replay is already emitting `can-frames`; a second source would make
+    // the page show two buses interleaved.
+    crate::replay::ensure_not_replaying(&app.state::<crate::replay::ReplayState>())?;
 
     // Racy by nature — the sweep could claim the flag right after this check —
     // but the loser then just fails to open the port, with a clearer message
@@ -442,7 +497,9 @@ fn probe_candidate(
             Ok(0) => thread::sleep(Duration::from_millis(1)),
             Ok(n) => {
                 buf.push_str(&String::from_utf8_lossy(&raw[..n]));
-                tally.observe(&drain_lines(&mut buf, now_ms()));
+                // The sweep only counts frames and their FD/BRS flags, so it
+                // has no use for a timestamp and skips reading the clock.
+                tally.observe(&drain_lines(&mut buf, || 0.0));
             }
             // Timeouts are how a silent bus looks — keep listening.
             Err(e) if e.kind() == ErrorKind::TimedOut => {}
@@ -575,6 +632,7 @@ pub async fn autodetect_bitrate(
         // interleaved into that sequence would corrupt it and poison the
         // frame counts the scoring is built on.
         crate::simulation::stop_running(&app.state::<SimulationState>())?;
+        crate::replay::ensure_not_replaying(&app.state::<crate::replay::ReplayState>())?;
         let state = app.state::<CanState>();
         run_bitrate_sweep(&app, &state, &port_name, read_only)
     })
@@ -608,7 +666,10 @@ pub fn can_connection_status(
         .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
-    Ok(guard.as_ref().map(|c| c.status.clone()))
+
+    // The stale `CanConnection` behind a lost port is cleaned up by the next
+    // connect or disconnect; until then it simply is not reported.
+    Ok(active(&guard).map(|c| c.status.clone()))
 }
 
 /// Returns the raw DBC bit indices occupied by a signal, matching
@@ -636,7 +697,7 @@ fn signal_bit_indices(start_bit: u64, size: u64, little_endian: bool) -> Vec<u64
 /// min/max. Reverse-engineered DBC files (e.g. opendbc-style) very commonly
 /// leave min/max as an unreliable placeholder like `0|1` regardless of bit
 /// width, so trusting them would reject values that are perfectly encodable.
-fn signal_range(signal: &DbcSignal) -> (f64, f64) {
+pub(crate) fn signal_range(signal: &DbcSignal) -> (f64, f64) {
     if signal.signed {
         let min_raw = -(1i64 << (signal.size - 1));
         let max_raw = (1i64 << (signal.size - 1)) - 1;
@@ -779,18 +840,23 @@ pub struct CanFrame {
     pub fd: bool,
     /// CAN FD only: the data phase ran at the faster data bitrate.
     pub bitrate_switch: bool,
+    /// A remote-request frame (`r`/`R`): it declares a length but carries no
+    /// payload, which is otherwise indistinguishable from a DLC-0 data frame.
+    pub remote: bool,
     pub data: Vec<u8>,
-    pub timestamp_ms: u64,
+    /// Epoch milliseconds, with a fractional part. Stamped per frame by the
+    /// reader, from a `FrameClock`.
+    pub timestamp_ms: f64,
 }
 
 /// The widest id each frame format can carry: 11 bits standard, 29 extended.
-const MAX_STANDARD_ID: u32 = 0x7FF;
-const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
+pub(crate) const MAX_STANDARD_ID: u32 = 0x7FF;
+pub(crate) const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
 
 /// The payload lengths CAN FD can express, indexed by DLC nibble. Above eight
 /// bytes the steps are coarse, which is why a payload has to be padded up to
 /// the next one rather than sent at its own length.
-const CAN_FD_DLC: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
+pub(crate) const CAN_FD_DLC: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
 
 /// The DLC nibble and padded byte count CAN FD uses to carry `len` bytes, or
 /// `None` if the payload is larger than a CAN FD frame.
@@ -931,26 +997,48 @@ fn parse_slcan_frame(line: &str) -> Option<CanFrame> {
         extended,
         fd,
         bitrate_switch,
+        remote,
         data,
-        timestamp_ms: 0,
+        timestamp_ms: 0.0,
     })
 }
 
 /// Strict hex parse: unlike `from_str_radix`, rejects a leading `+`/`-` sign
 /// so a line like `t+101FF` is not mistaken for a frame.
-fn parse_hex(hex: &str) -> Option<u32> {
+pub(crate) fn parse_hex(hex: &str) -> Option<u32> {
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// How often the reader flushes buffered frames to the frontend, and the
-/// batch size that forces an early flush. A busy 500 kbit/s bus produces
-/// thousands of frames a second; emitting one event each would swamp the
-/// webview, so they go over in ~33 batches/s instead.
+/// How often the reader hands buffered frames to the frontend.
+///
+/// A **floor**, not a hint. `Emitter::emit` serializes the batch to JSON and
+/// evaluates a script in the webview; from a background thread that is posted
+/// through the runtime's event-loop proxy — an unbounded queue drained on the
+/// main thread. The reader never waits for the webview, so an emit rate that
+/// tracks the bus rate lets that queue grow without limit while React is busy.
+/// This is the only thing bounding it.
 const RX_FLUSH_INTERVAL: Duration = Duration::from_millis(30);
-const RX_BATCH_CAP: usize = 256;
+
+/// Most frames one event may carry. Past this the oldest are dropped and
+/// counted, which is what bounds both the buffer and the size of each event.
+///
+/// At ~33 events a second this still delivers well over 30 000 frames/s — far
+/// more than a 500 kbit/s bus can produce — so a real adapter never reaches
+/// it. A replay running as fast as it can does, which is the point: memory
+/// stays flat and the drop counter rises instead.
+pub(crate) const RX_PENDING_CAP: usize = 1024;
+
+/// How often adapter rejections are reported, at most.
+const RX_ERROR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Read timeout on the reader's handle, well below the writer's
+/// `SERIAL_TIMEOUT`. `stop` is only checked between reads, so this is what a
+/// join actually costs — half a second of it made every connect and
+/// disconnect visibly stall the window.
+const RX_READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Guards against unbounded growth if the adapter ever streams bytes with no
 /// line terminator in sight.
@@ -970,7 +1058,19 @@ struct RxBatch {
 /// Lines end in `\r`, or in the BEL byte the adapter sends to reject a frame
 /// we transmitted. BEL is counted rather than parsed: it is the ack that
 /// `write_frame` used to read inline, and which now belongs to this thread.
-fn drain_lines(buf: &mut String, timestamp_ms: u64) -> RxBatch {
+///
+/// `now` is read **once per parsed frame**, not once per call. One 1 KiB read
+/// can complete dozens of frames, and stamping them all from a single reading
+/// made a capture claim simultaneous bursts that never happened — which is
+/// precisely the arrival pattern the live view struggles with. It is a
+/// parameter rather than a call to the clock so the timestamps stay testable,
+/// the same rule `parse_slcan_frame` follows by leaving the field at zero.
+///
+/// This does not buy hardware timestamps. Frames that genuinely arrive inside
+/// one `port.read` are still separated only by the microseconds it takes to
+/// parse them; the resolution ceiling is the read cadence, and `python-can`
+/// works to the same one.
+fn drain_lines(buf: &mut String, mut now: impl FnMut() -> f64) -> RxBatch {
     let mut batch = RxBatch::default();
     let Some(end) = buf.rfind(['\r', '\u{7}']) else {
         if buf.len() > RX_BUFFER_LIMIT {
@@ -985,17 +1085,67 @@ fn drain_lines(buf: &mut String, timestamp_ms: u64) -> RxBatch {
             batch.rejections += 1;
         }
         if let Some(mut frame) = parse_slcan_frame(line) {
-            frame.timestamp_ms = timestamp_ms;
+            frame.timestamp_ms = now();
             batch.frames.push(frame);
         }
     }
     batch
 }
 
-/// Whether buffered frames should go out now — either the batching window
-/// elapsed or the batch grew large enough that waiting would add latency.
-fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
-    pending > 0 && (pending >= RX_BATCH_CAP || since_last_flush >= RX_FLUSH_INTERVAL)
+/// Whether buffered frames should go out now.
+///
+/// Only the window decides. A buffer-size trigger used to short-circuit it,
+/// which meant the batching promised a bounded event rate and did not deliver
+/// one; the size limit is now `trim_pending`'s job instead, where overflow
+/// costs frames rather than events.
+pub(crate) fn should_flush(pending: usize, since_last_flush: Duration) -> bool {
+    pending > 0 && since_last_flush >= RX_FLUSH_INTERVAL
+}
+
+/// Drops the oldest frames so the buffer cannot outgrow `cap`, returning how
+/// many went.
+///
+/// Oldest rather than newest: on a bus this saturated the newest frame is the
+/// one worth showing, and a dropped-frame counter beats a card that has
+/// quietly stopped moving. The recorder sees the frames first and keeps all of
+/// them, so a capture is unaffected — the recording is ground truth, the event
+/// stream is best-effort.
+pub(crate) fn trim_pending(pending: &mut Vec<CanFrame>, cap: usize) -> usize {
+    let excess = pending.len().saturating_sub(cap);
+    if excess > 0 {
+        pending.drain(..excess);
+    }
+    excess
+}
+
+/// Whether a rejection notice is due. Coalesced, because an adapter refusing
+/// every frame used to produce one event per read for a listener that did not
+/// exist.
+fn should_report_rejections(pending: usize, since_last_report: Duration) -> bool {
+    pending > 0 && since_last_report >= RX_ERROR_INTERVAL
+}
+
+/// How many frames an adapter refused to transmit in the last window.
+#[derive(Serialize, Clone)]
+struct AdapterRejections {
+    rejections: usize,
+}
+
+/// Emits one `can-frames` event as `(frames, dropped)`.
+///
+/// Shared by the reader and the replay engine so the two cannot drift into
+/// emitting different shapes.
+///
+/// **A tuple rather than a named struct, and that is not a style choice.**
+/// tauri-typegen recognizes a named struct at an `app.emit` call site and
+/// generates a Zod schema for it — and a `FrameBatch { frames: Vec<CanFrame> }`
+/// produces a schema referencing a `CanFrameSchema` that typegen never emits,
+/// because `CanFrame` appears in no command signature. The generated
+/// `types.ts` then does not compile, and it must not be hand-edited. A tuple
+/// has no name for typegen to pick up. The readable shape is restored at the
+/// frontend boundary, in `useCanFrames`.
+pub(crate) fn emit_frames(app: &AppHandle, frames: &[CanFrame], dropped: usize) {
+    let _ = app.emit("can-frames", (frames, dropped));
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -1003,6 +1153,40 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Epoch-relative frame timestamps that cannot go backwards.
+///
+/// Two properties are needed at once and no single clock has both. A capture
+/// stores Unix epoch seconds, so the origin has to be wall-clock — but
+/// `SystemTime` can step sideways (NTP, a manual clock change, a laptop
+/// waking), and a replay reconstructs timing from inter-frame *deltas*, so one
+/// backwards step renders as a frame arriving before the one ahead of it.
+///
+/// Anchoring a monotonic `Instant` to one `SystemTime` reading keeps both:
+/// epoch-relative, and non-decreasing for the life of the connection. The
+/// anchor is taken once, per reader thread, so a long-running capture drifts
+/// against the wall clock rather than jumping — which is the trade a recording
+/// wants.
+pub(crate) struct FrameClock {
+    anchor_ms: f64,
+    start: Instant,
+}
+
+impl FrameClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            anchor_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1_000.0)
+                .unwrap_or(0.0),
+            start: Instant::now(),
+        }
+    }
+
+    pub(crate) fn now_ms(&self) -> f64 {
+        self.anchor_ms + self.start.elapsed().as_secs_f64() * 1_000.0
+    }
 }
 
 /// Reads the port until `stop` is set, emitting batched `can-frames` events.
@@ -1013,12 +1197,22 @@ fn spawn_reader(
     app: AppHandle,
     mut port: Box<dyn SerialPort>,
     stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut raw = [0u8; 1024];
         let mut buf = String::new();
         let mut pending: Vec<CanFrame> = Vec::new();
+        let mut dropped = 0usize;
+        let mut rejections = 0usize;
         let mut last_flush = Instant::now();
+        let mut last_report = Instant::now();
+        let clock = FrameClock::new();
+        // Taken from the managed state rather than threaded down through
+        // `open_connection`, and cloned once rather than looked up per batch.
+        // The `Arc` is what lets a recording start and stop mid-connection
+        // without disturbing this thread's lifecycle.
+        let recorder = Arc::clone(&app.state::<RecordingState>().handle);
 
         while !stop.load(Ordering::Relaxed) {
             match port.read(&mut raw) {
@@ -1026,23 +1220,44 @@ fn spawn_reader(
                 Ok(0) => thread::sleep(Duration::from_millis(1)),
                 Ok(n) => {
                     buf.push_str(&String::from_utf8_lossy(&raw[..n]));
-                    let batch = drain_lines(&mut buf, now_ms());
-                    if batch.rejections > 0 {
-                        let _ = app.emit("can-error", "Adapter rejected a frame");
-                    }
+                    let batch = drain_lines(&mut buf, || clock.now_ms());
+                    rejections += batch.rejections;
+                    // Recorded before the emit, and unconditionally: the
+                    // capture is ground truth, the event stream is
+                    // best-effort. Now that the emit path can drop frames,
+                    // the recording is also the only complete copy.
+                    recorder.write_frames(&batch.frames);
                     pending.extend(batch.frames);
+                    dropped += trim_pending(&mut pending, RX_PENDING_CAP);
                 }
                 // Timeouts are how an idle bus looks — keep waiting.
                 Err(e) if e.kind() == ErrorKind::TimedOut => {}
                 // Anything else means the port is gone (unplugged, closed).
-                Err(_) => break,
+                // Say so: the reader is the only thing that finds out, and
+                // without this the page keeps claiming a live connection.
+                Err(_) => {
+                    lost.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            if should_report_rejections(rejections, last_report.elapsed()) {
+                let _ = app.emit("can-error", AdapterRejections { rejections });
+                rejections = 0;
+                last_report = Instant::now();
             }
 
             if should_flush(pending.len(), last_flush.elapsed()) {
-                let _ = app.emit("can-frames", &pending);
+                emit_frames(&app, &pending, dropped);
                 pending.clear();
+                dropped = 0;
                 last_flush = Instant::now();
             }
+        }
+
+        // Whatever ended the loop, the frames already parsed are real.
+        if !pending.is_empty() {
+            emit_frames(&app, &pending, dropped);
         }
     })
 }
@@ -1063,6 +1278,24 @@ pub(crate) fn write_frame(
         port,
         &format_slcan_frame(id, extended, fd, bitrate_switch, data)?,
     )
+}
+
+/// Refuses when a device is connected.
+///
+/// A replay and a live adapter both emit `can-frames`, and two sources at once
+/// would make every frame count and every memory measurement meaningless. The
+/// mirror of this guard lives in `replay::ensure_not_replaying`.
+pub(crate) fn ensure_no_device(state: &CanState) -> Result<(), String> {
+    let guard = state
+        .connection
+        .lock()
+        .map_err(|_| "CAN state poisoned".to_string())?;
+    if active(&guard).is_some() {
+        return Err(
+            "A CAN device is connected; disconnect it before replaying a capture".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Hands the simulation scheduler its own write handle to the open port,
@@ -1173,6 +1406,18 @@ mod tests {
             bitrate: 500_000,
             data_bitrate: None,
             read_only,
+        }
+    }
+
+    fn rx_frame(id: u32) -> CanFrame {
+        CanFrame {
+            id,
+            extended: false,
+            fd: false,
+            bitrate_switch: false,
+            remote: false,
+            data: vec![0],
+            timestamp_ms: 0.0,
         }
     }
 
@@ -1312,7 +1557,7 @@ mod tests {
     fn probe_tally_counts_fd_and_brs_frames() {
         let mut buf = String::from("b0A0A20E0020000000A990000000000000000\rt1A01FF\r\u{7}");
         let mut probed = ProbeTally::default();
-        probed.observe(&drain_lines(&mut buf, 0));
+        probed.observe(&drain_lines(&mut buf, || 0.0));
 
         assert_eq!(probed, tally(2, 1, 1, 1));
     }
@@ -1495,7 +1740,7 @@ mod tests {
             frame.data,
             vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]
         );
-        assert_eq!(frame.timestamp_ms, 0);
+        assert_eq!(frame.timestamp_ms, 0.0);
     }
 
     #[test]
@@ -1504,6 +1749,26 @@ mod tests {
         assert_eq!(frame.id, 0x18DAF110);
         assert!(frame.extended);
         assert_eq!(frame.data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn parse_slcan_frame_marks_a_remote_frame() {
+        // `r`/`R` were already recognized; the distinction was parsed and then
+        // thrown away, leaving a remote frame indistinguishable from a data
+        // frame with DLC 0 — which the capture format has a column for.
+        let remote = parse_slcan_frame("r1A08").unwrap();
+        assert!(remote.remote);
+        assert!(remote.data.is_empty());
+
+        let extended = parse_slcan_frame("R18DAF1108").unwrap();
+        assert!(extended.remote);
+        assert!(extended.extended);
+    }
+
+    #[test]
+    fn parse_slcan_frame_does_not_mark_a_data_frame_remote() {
+        assert!(!parse_slcan_frame("t1A01FF").unwrap().remote);
+        assert!(!parse_slcan_frame("b0A00").unwrap().remote);
     }
 
     #[test]
@@ -1694,7 +1959,7 @@ mod tests {
     #[test]
     fn drain_lines_extracts_complete_frames_and_keeps_the_partial() {
         let mut buf = String::from("t1A01FF\rt1A01EE\rt1A0");
-        let batch = drain_lines(&mut buf, 42);
+        let batch = drain_lines(&mut buf, || 42.0);
         assert_eq!(batch.frames.len(), 2);
         assert_eq!(batch.frames[0].data, vec![0xFF]);
         assert_eq!(batch.frames[1].data, vec![0xEE]);
@@ -1707,11 +1972,11 @@ mod tests {
         let mut buf = String::new();
 
         buf.push_str("t1A08DEAD");
-        let batch = drain_lines(&mut buf, 1);
+        let batch = drain_lines(&mut buf, || 1.0);
         assert!(batch.frames.is_empty(), "no terminator yet");
 
         buf.push_str("BEEF00112233\r");
-        let batch = drain_lines(&mut buf, 2);
+        let batch = drain_lines(&mut buf, || 2.0);
         assert_eq!(batch.frames.len(), 1);
         assert_eq!(
             batch.frames[0].data,
@@ -1721,17 +1986,88 @@ mod tests {
     }
 
     #[test]
-    fn drain_lines_stamps_every_frame_with_the_given_timestamp() {
-        let mut buf = String::from("t1A01FF\rt1A01EE\r");
-        let batch = drain_lines(&mut buf, 1234);
-        assert!(batch.frames.iter().all(|f| f.timestamp_ms == 1234));
+    fn drain_lines_stamps_each_frame_separately() {
+        // One `port.read` can complete dozens of frames. Stamping them all
+        // from a single clock reading is what made a recording claim bursts
+        // that never happened.
+        let mut buf = String::from("t1A01FF\rt1A01EE\rt1A01DD\r");
+        let mut tick = 0.0;
+        let batch = drain_lines(&mut buf, || {
+            tick += 0.25;
+            tick
+        });
+
+        let stamps: Vec<f64> = batch.frames.iter().map(|f| f.timestamp_ms).collect();
+        assert_eq!(
+            stamps,
+            vec![0.25, 0.5, 0.75],
+            "every frame must carry its own reading, in arrival order"
+        );
+    }
+
+    #[test]
+    fn drain_lines_keeps_a_sub_millisecond_timestamp() {
+        let mut buf = String::from("t1A01FF\r");
+        let batch = drain_lines(&mut buf, || 1_234.567_25);
+
+        assert_eq!(
+            batch.frames[0].timestamp_ms, 1_234.567_25,
+            "the fractional part must survive; truncating it puts us back at millisecond quantization"
+        );
+    }
+
+    #[test]
+    fn drain_lines_does_not_read_the_clock_for_a_line_that_is_not_a_frame() {
+        // A bare ack, a version reply and a rejection all pass through here.
+        let mut buf = String::from("\rV1010\r\u{7}");
+        let mut readings = 0;
+        let batch = drain_lines(&mut buf, || {
+            readings += 1;
+            0.0
+        });
+
+        assert!(batch.frames.is_empty());
+        assert_eq!(readings, 0, "only a parsed frame needs a timestamp");
+    }
+
+    #[test]
+    fn a_frame_clock_never_goes_backwards() {
+        let clock = FrameClock::new();
+        let readings: Vec<f64> = (0..64).map(|_| clock.now_ms()).collect();
+
+        assert!(
+            readings.windows(2).all(|w| w[1] >= w[0]),
+            "a capture stores deltas; one backwards step renders as a frame arriving before the one ahead of it"
+        );
+    }
+
+    #[test]
+    fn a_frame_clock_is_anchored_to_the_wall_clock() {
+        let clock = FrameClock::new();
+        let drift = (clock.now_ms() - now_ms() as f64).abs();
+
+        assert!(
+            drift < 1_000.0,
+            "epoch-relative, not an arbitrary monotonic origin: the CSV stores epoch seconds (drift was {drift} ms)"
+        );
+    }
+
+    #[test]
+    fn a_frame_clock_resolves_below_a_millisecond() {
+        let clock = FrameClock::new();
+        let readings: Vec<f64> = (0..1_000).map(|_| clock.now_ms()).collect();
+
+        assert!(
+            readings.iter().any(|ms| ms.fract() != 0.0),
+            "whole-millisecond readings would defeat the point of the f64"
+        );
     }
 
     #[test]
     fn drain_lines_counts_bel_as_a_rejection_not_a_frame() {
         // The adapter answers a transmit command with BEL when it rejects it.
         let mut buf = String::from("\u{7}t1A01FF\r");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert_eq!(batch.rejections, 1);
         assert_eq!(batch.frames.len(), 1);
     }
@@ -1740,7 +2076,7 @@ mod tests {
     fn drain_lines_ignores_empty_and_unparsable_lines() {
         // A bare ack, a version reply and garbage all sit in the same stream.
         let mut buf = String::from("\rV1010\rgarbage\rt1A01FF\r");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert_eq!(batch.frames.len(), 1);
         assert_eq!(batch.rejections, 0);
         assert!(buf.is_empty());
@@ -1749,20 +2085,115 @@ mod tests {
     #[test]
     fn drain_lines_returns_nothing_when_no_line_is_complete() {
         let mut buf = String::from("t1A01F");
-        let batch = drain_lines(&mut buf, 0);
+        let batch = drain_lines(&mut buf, || 0.0);
         assert!(batch.frames.is_empty());
         assert_eq!(buf, "t1A01F", "the buffer is left untouched");
     }
 
+    /// A stand-in for the reader: it watches the real stop flag, so these
+    /// exercise the real teardown rather than a mocked one.
+    fn fake_reader(stop: &Arc<AtomicBool>) -> JoinHandle<()> {
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    }
+
     #[test]
-    fn should_flush_batches_until_the_interval_or_the_cap() {
+    fn stop_reader_signals_and_joins() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Some(fake_reader(&stop));
+
+        stop_reader(&stop, &mut reader);
+
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(
+            reader.is_none(),
+            "the handle must be taken, not left behind"
+        );
+    }
+
+    #[test]
+    fn stop_reader_is_idempotent() {
+        // `Drop` runs it again after `disconnect_can_device` already has.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Some(fake_reader(&stop));
+
+        stop_reader(&stop, &mut reader);
+        stop_reader(&stop, &mut reader);
+    }
+
+    #[test]
+    fn stop_reader_copes_with_a_connection_that_never_spawned_one() {
+        let stop = Arc::new(AtomicBool::new(false));
+        stop_reader(&stop, &mut None);
+    }
+
+    #[test]
+    fn a_connection_whose_reader_died_reports_itself_disconnected() {
+        // The reader is the only thing that knows the port is gone. Without
+        // this, unplugging the adapter leaves `can_connection_status`
+        // claiming a healthy connection forever.
+        let lost = Arc::new(AtomicBool::new(false));
+        assert!(!connection_lost(&lost));
+
+        lost.store(true, Ordering::Relaxed);
+        assert!(connection_lost(&lost));
+    }
+
+    #[test]
+    fn should_flush_waits_for_the_interval() {
         // Nothing buffered: never flush, however long it has been.
         assert!(!should_flush(0, Duration::from_secs(1)));
         // Buffered but still inside the window: keep batching.
         assert!(!should_flush(1, Duration::from_millis(5)));
         // The interval elapsed.
         assert!(should_flush(1, RX_FLUSH_INTERVAL));
-        // The cap is reached before the interval, so a burst flushes early.
-        assert!(should_flush(RX_BATCH_CAP, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn a_full_buffer_no_longer_bypasses_the_flush_interval() {
+        // The old rule flushed early once the buffer reached a cap, so the
+        // "~33 events/s" the batching promises held only on a quiet bus: on a
+        // loud one the emit rate was bounded by nothing but how fast
+        // `port.read` returned, and every event is a script evaluated on the
+        // main thread through an unbounded queue.
+        assert!(
+            !should_flush(RX_PENDING_CAP * 10, Duration::from_millis(0)),
+            "the interval is a floor, not a hint"
+        );
+    }
+
+    #[test]
+    fn trim_pending_leaves_a_buffer_inside_the_cap_alone() {
+        let mut pending = vec![rx_frame(1), rx_frame(2)];
+        assert_eq!(trim_pending(&mut pending, 4), 0);
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn trim_pending_drops_the_oldest_frames_and_counts_them() {
+        // Oldest rather than newest: on a bus this saturated the newest frame
+        // is the one worth showing, and a dropped-frame counter beats a card
+        // that has quietly stopped moving.
+        let mut pending = vec![rx_frame(1), rx_frame(2), rx_frame(3), rx_frame(4)];
+
+        assert_eq!(trim_pending(&mut pending, 2), 2);
+        assert_eq!(
+            pending.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![3, 4],
+            "the survivors must be the newest"
+        );
+    }
+
+    #[test]
+    fn should_report_rejections_coalesces_to_one_per_window() {
+        // Emitted once per read chunk, this flooded the main thread with
+        // events for a listener that did not exist.
+        assert!(!should_report_rejections(0, Duration::from_secs(10)));
+        assert!(!should_report_rejections(5, Duration::from_millis(10)));
+        assert!(should_report_rejections(1, RX_ERROR_INTERVAL));
     }
 }

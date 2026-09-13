@@ -1,5 +1,8 @@
 mod can;
 mod dbc;
+pub mod generator;
+pub mod recording;
+pub mod replay;
 pub mod simulation;
 
 use can::{
@@ -8,6 +11,9 @@ use can::{
     CanState,
 };
 use dbc::parse_dbc_file;
+use generator::generate_capture;
+use recording::{recording_status, start_recording, stop_recording, RecordingState};
+use replay::{replay_status, start_replay, stop_replay, ReplayState};
 use simulation::{simulation_status, start_simulation, stop_simulation, SimulationState};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
@@ -24,13 +30,24 @@ pub fn run() {
     let mut builder = tauri::Builder::default();
     #[cfg(debug_assertions)] // only enable instrumentation in development builds
     {
-        builder = builder.plugin(tauri_plugin_devtools::init());
+        // The devtools plugin installs a global `tracing` subscriber that
+        // buffers every command and event in memory, which puts it in front of
+        // ~33 `can-frames` emits a second. That makes it the first variable to
+        // rule out in any memory measurement, so it can be switched off
+        // without editing this file:
+        //
+        //     CAN_TOOL_NO_DEVTOOLS=1 just dev
+        if std::env::var_os("CAN_TOOL_NO_DEVTOOLS").is_none() {
+            builder = builder.plugin(tauri_plugin_devtools::init());
+        }
     }
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(CanState::default())
         .manage(SimulationState::default())
+        .manage(RecordingState::default())
+        .manage(ReplayState::default())
         .invoke_handler(tauri::generate_handler![
             parse_dbc_file,
             list_can_devices,
@@ -45,6 +62,13 @@ pub fn run() {
             start_simulation,
             stop_simulation,
             simulation_status,
+            start_recording,
+            stop_recording,
+            recording_status,
+            start_replay,
+            stop_replay,
+            replay_status,
+            generate_capture,
         ])
         .menu(|handle| {
             // On macOS the *first* top-level submenu is always coerced into the

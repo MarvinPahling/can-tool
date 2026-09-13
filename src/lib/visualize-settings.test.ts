@@ -98,3 +98,38 @@ describe("loading stored settings", () => {
 		expect(loadVisualizeSettings()).toEqual(DEFAULT_VISUALIZE_SETTINGS);
 	});
 });
+
+describe("maxLiveIds", () => {
+	it("is off by default, because a cap hides real traffic", () => {
+		expect(DEFAULT_VISUALIZE_SETTINGS.maxLiveIds).toBeNull();
+	});
+
+	it("keeps an explicit null rather than reading it as absent", () => {
+		setVisualizeSettings({ maxLiveIds: 512 });
+		setVisualizeSettings({ maxLiveIds: null });
+
+		expect(visualizeSettingsStore.state.maxLiveIds).toBeNull();
+	});
+
+	it("clamps a hand-edited cap into something renderable", () => {
+		setVisualizeSettings({ maxLiveIds: 0 });
+		expect(visualizeSettingsStore.state.maxLiveIds).toBe(1);
+
+		setVisualizeSettings({ maxLiveIds: 10_000_000 });
+		expect(visualizeSettingsStore.state.maxLiveIds).toBe(100_000);
+	});
+
+	it("rounds a fractional cap", () => {
+		setVisualizeSettings({ maxLiveIds: 12.7 });
+		expect(visualizeSettingsStore.state.maxLiveIds).toBe(13);
+	});
+
+	it("ignores a cap of the wrong type", () => {
+		setVisualizeSettings({ maxLiveIds: 64 });
+		setVisualizeSettings({
+			maxLiveIds: "lots",
+		} as unknown as Partial<typeof DEFAULT_VISUALIZE_SETTINGS>);
+
+		expect(visualizeSettingsStore.state.maxLiveIds).toBe(64);
+	});
+});

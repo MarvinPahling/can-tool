@@ -4,21 +4,44 @@ import type { CanFrame } from "@/api/can";
 import { makeDbcFile, makeMessage, makeSignal } from "@/test/fixtures";
 import { LiveTraffic } from "./live-traffic";
 
-const { emitFrames, useCanFrames, useConnectionStatus, useCurrentDbc } =
-	vi.hoisted(() => {
-		let handler: ((frames: unknown[]) => void) | undefined;
-		return {
-			useCanFrames: vi.fn((cb: (frames: unknown[]) => void) => {
-				handler = cb;
-			}),
-			useConnectionStatus: vi.fn(),
-			useCurrentDbc: vi.fn(),
-			emitFrames: (frames: CanFrame[]) => handler?.(frames),
-		};
-	});
+const {
+	emitFrames,
+	useCanFrames,
+	useConnectionStatus,
+	useCurrentDbc,
+	useReplayStatus,
+	useCanError,
+	emitRejections,
+} = vi.hoisted(() => {
+	let handler: ((batch: unknown) => void) | undefined;
+	let errorHandler: ((event: unknown) => void) | undefined;
+	return {
+		useCanFrames: vi.fn((cb: (batch: unknown) => void, enabled = true) => {
+			// Only a live subscription reaches the fold; a disabled one must
+			// not, or the state grows behind a guard nothing renders from.
+			handler = enabled ? cb : undefined;
+		}),
+		useCanError: vi.fn((cb: (event: unknown) => void) => {
+			errorHandler = cb;
+		}),
+		useConnectionStatus: vi.fn(),
+		useCurrentDbc: vi.fn(),
+		useReplayStatus: vi.fn(),
+		emitFrames: (frames: CanFrame[], dropped = 0) =>
+			handler?.({ frames, dropped }),
+		emitRejections: (rejections: number) => errorHandler?.({ rejections }),
+	};
+});
 
-vi.mock("@/queries/can", () => ({ useCanFrames, useConnectionStatus }));
+vi.mock("@/queries/can", () => ({
+	useCanError,
+	useCanFrames,
+	useConnectionStatus,
+}));
 vi.mock("@/queries/dbc", () => ({ useCurrentDbc }));
+vi.mock("@/queries/recording", () => ({ useReplayStatus }));
+// The capture controls have their own test; here they are only in the way.
+vi.mock("./capture-bar", () => ({ CaptureBar: () => null }));
 
 const dbc = makeDbcFile({
 	messages: [
@@ -41,6 +64,7 @@ function frame(overrides: Partial<CanFrame> = {}): CanFrame {
 		extended: false,
 		fd: false,
 		bitrate_switch: false,
+		remote: false,
 		data: [5],
 		timestamp_ms: 1000,
 		...overrides,
@@ -48,9 +72,15 @@ function frame(overrides: Partial<CanFrame> = {}): CanFrame {
 }
 
 /** Pushes frames in, then lets the render-flush interval fire. */
-function deliver(frames: CanFrame[]) {
+/** Whether the most recent `useCanFrames` call asked to be subscribed. */
+function lastEnabled(): boolean | undefined {
+	const calls = useCanFrames.mock.calls;
+	return calls[calls.length - 1]?.[1];
+}
+
+function deliver(frames: CanFrame[], dropped = 0) {
 	act(() => {
-		emitFrames(frames);
+		emitFrames(frames, dropped);
 		vi.advanceTimersByTime(200);
 	});
 }
@@ -64,6 +94,7 @@ beforeEach(() => {
 	useConnectionStatus.mockReturnValue({
 		data: { port_name: "tty", bitrate: 5e5 },
 	});
+	useReplayStatus.mockReturnValue({ data: { running: false } });
 });
 
 afterEach(() => {
@@ -79,11 +110,24 @@ describe("LiveTraffic", () => {
 		expect(screen.getByText(/no dbc/i)).toBeInTheDocument();
 	});
 
-	it("prompts to connect when there is no device", () => {
+	it("prompts to connect when nothing is producing frames", () => {
 		useConnectionStatus.mockReturnValue({ data: null });
 		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
 
-		expect(screen.getByText(/not connected/i)).toBeInTheDocument();
+		expect(screen.getByText(/no frames arriving/i)).toBeInTheDocument();
+	});
+
+	it("renders the grid during a replay with no device connected", () => {
+		// The whole point of the harness: frames with nothing plugged in. If the
+		// guard only knew about adapters, a replay would render an alert.
+		useConnectionStatus.mockReturnValue({ data: null });
+		useReplayStatus.mockReturnValue({ data: { running: true } });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		expect(screen.queryByText(/no frames arriving/i)).not.toBeInTheDocument();
+
+		deliver([frame()]);
+		expect(screen.getByText("Speed")).toBeInTheDocument();
 	});
 
 	it("waits quietly until the first frame arrives", () => {
@@ -144,5 +188,76 @@ describe("LiveTraffic", () => {
 		deliver([frame({ id: 0x777, data: [1] })]);
 
 		expect(screen.getByText("Not in DBC")).toBeInTheDocument();
+	});
+
+	it("says when the backend had to drop frames", () => {
+		// Silently showing stale cards would be worse than the drop: the page
+		// has to be able to admit it is behind.
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()], 1_500);
+
+		expect(screen.getByText(/1,500 dropped/)).toBeInTheDocument();
+	});
+
+	it("does not mention drops on a healthy bus", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(screen.queryByText(/dropped/)).not.toBeInTheDocument();
+	});
+
+	it("surfaces adapter transmit rejections", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		act(() => {
+			emitRejections(3);
+			emitRejections(4);
+		});
+
+		expect(
+			screen.getByText(/7 transmitted frames were refused/),
+		).toBeInTheDocument();
+	});
+
+	it("does not fold frames while the no-DBC guard is showing", () => {
+		// The hooks run before the guard is decided, so without switching the
+		// subscription off the map grew the whole time a static alert was on
+		// screen, with nothing to hint at it.
+		useCurrentDbc.mockReturnValue({ data: undefined });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(lastEnabled()).toBe(false);
+	});
+
+	it("does not fold frames while nothing is producing them", () => {
+		useConnectionStatus.mockReturnValue({ data: null });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(lastEnabled()).toBe(false);
+	});
+
+	it("folds frames once there is a DBC and a source", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+		expect(lastEnabled()).toBe(true);
+	});
+
+	it("keeps the cards in id order as new ids appear", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame({ id: 0x2b0 })]);
+		deliver([frame({ id: 0x1a0 })]);
+
+		// The state map is kept in recency order for eviction, so the display
+		// order is sorted separately — and only when the id set moves.
+		const names = screen
+			.getAllByText(/^(Speed|Brake)$/)
+			.map((node) => node.textContent);
+		expect(names).toEqual(["Speed", "Brake"]);
 	});
 });

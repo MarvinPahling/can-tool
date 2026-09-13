@@ -4,9 +4,9 @@ import {
 	Link,
 	Outlet,
 } from "@tanstack/react-router";
-import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import { CommandsProvider } from "@/commands";
 import { DeviceConnectDialog } from "@/components/device-connect-dialog";
+import { RouterDevtools } from "@/components/devtools";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
 import { Titlebar } from "@/components/titlebar";
 
@@ -35,7 +35,7 @@ function RootComponent() {
 				<div className="flex-1 overflow-auto">
 					<Outlet />
 				</div>
-				<TanStackRouterDevtools position="bottom-right" />
+				<RouterDevtools />
 			</div>
 			<ShortcutsDialog />
 			<DeviceConnectDialog />
