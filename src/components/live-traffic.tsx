@@ -10,6 +10,7 @@ import { VisualizeSettingsPopover } from "@/components/visualize-settings-popove
 import { useVisualizeSettings } from "@/hooks/use-visualize-settings";
 import {
 	applyFrames,
+	buildMessageIndex,
 	type LiveMessage,
 	type LiveState,
 } from "@/lib/live-messages";
@@ -61,18 +62,26 @@ export function LiveTraffic({
 	// counting when it is switched on would be a rate of the readout.
 	const receivedRef = useRef({ frames: 0, batches: 0 });
 	const droppedRef = useRef(0);
+	const evictedRef = useRef(0);
 	const [messages, setMessages] = useState<LiveMessage[]>([]);
 	const [dropped, setDropped] = useState(0);
+	const [evicted, setEvicted] = useState(0);
 	const [rejections, setRejections] = useState(0);
 
 	const dbcFile = dbc.data;
+	// Built once per loaded file, not once per batch: it is O(messages x
+	// signals) and does not depend on the frames at all.
+	const index = useMemo(() => buildMessageIndex(dbcFile), [dbcFile]);
+
 	useCanFrames((batch) => {
-		stateRef.current = applyFrames(
+		const result = applyFrames(
 			stateRef.current,
 			batch.frames,
-			dbcFile,
+			index,
 			settings,
+			settings.maxLiveIds,
 		);
+		evictedRef.current += result.evicted;
 		dirtyRef.current = true;
 		receivedRef.current.frames += batch.frames.length;
 		receivedRef.current.batches += 1;
@@ -97,7 +106,9 @@ export function LiveTraffic({
 	// biome-ignore lint/correctness/useExhaustiveDependencies: resetting is the point of watching dbcFile
 	useEffect(() => {
 		stateRef.current = new Map();
+		evictedRef.current = 0;
 		setMessages([]);
+		setEvicted(0);
 	}, [dbcFile]);
 
 	useEffect(() => {
@@ -106,6 +117,7 @@ export function LiveTraffic({
 			dirtyRef.current = false;
 			setMessages([...stateRef.current.values()].sort((a, b) => a.id - b.id));
 			setDropped(droppedRef.current);
+			setEvicted(evictedRef.current);
 		}, RENDER_INTERVAL_MS);
 		return () => clearInterval(id);
 	}, []);
@@ -116,8 +128,8 @@ export function LiveTraffic({
 	);
 
 	// A replay is a frame source in its own right — that is the whole point of
-	// it — so "connected" here means "something is producing frames", not
-	// "an adapter is plugged in".
+	// it — so "connected" here means "something is producing frames", not "an
+	// adapter is plugged in".
 	const hasSource = Boolean(status.data) || Boolean(replay.data?.running);
 
 	const guard = !dbcFile ? (
@@ -183,6 +195,14 @@ export function LiveTraffic({
 				<span className="text-xs text-muted-foreground">
 					{`${messages.length} messages`}
 				</span>
+				{evicted > 0 && (
+					<span
+						className="text-xs text-muted-foreground"
+						title="Ids dropped to stay within the limit set in the highlight settings. The oldest go first."
+					>
+						{`${evicted.toLocaleString()} ids evicted`}
+					</span>
+				)}
 				{dropped > 0 && (
 					<span
 						className="text-xs text-destructive"

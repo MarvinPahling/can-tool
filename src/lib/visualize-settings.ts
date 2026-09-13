@@ -11,6 +11,16 @@ export interface VisualizeSettings {
 	thresholdEnabled: boolean;
 	/** How large a change must be, as a percentage of the signal's range. */
 	thresholdPercent: number;
+	/**
+	 * Most CAN ids to keep on screen, or `null` for no limit.
+	 *
+	 * Off by default, and deliberately so. A bus with an id per source address
+	 * — J1939, UDS responses — has no natural bound, and one card plus one DOM
+	 * node per signal per id is what the page cannot survive. But a cap
+	 * silently hides real traffic, which is a correctness cost traded for a
+	 * memory one, so it is the user's call rather than ours.
+	 */
+	maxLiveIds: number | null;
 }
 
 export const DEFAULT_VISUALIZE_SETTINGS: VisualizeSettings = {
@@ -18,10 +28,12 @@ export const DEFAULT_VISUALIZE_SETTINGS: VisualizeSettings = {
 	fadeMs: 800,
 	thresholdEnabled: false,
 	thresholdPercent: 5,
+	maxLiveIds: null,
 };
 
 const FADE_MS_RANGE = { min: 100, max: 5000 } as const;
 const THRESHOLD_PERCENT_RANGE = { min: 0, max: 100 } as const;
+const MAX_LIVE_IDS_RANGE = { min: 1, max: 100_000 } as const;
 
 function clamp(value: number, { min, max }: { min: number; max: number }) {
 	return Math.min(Math.max(value, min), max);
@@ -59,6 +71,17 @@ function merge(
 			patch.thresholdPercent,
 			THRESHOLD_PERCENT_RANGE,
 		);
+	}
+	// `null` is a real choice — no limit — so it has to survive the merge
+	// rather than reading as "absent", the same way `dataBitrate` does in
+	// `connect-settings.ts`.
+	if (patch.maxLiveIds === null) {
+		next.maxLiveIds = null;
+	} else if (
+		typeof patch.maxLiveIds === "number" &&
+		Number.isFinite(patch.maxLiveIds)
+	) {
+		next.maxLiveIds = clamp(Math.round(patch.maxLiveIds), MAX_LIVE_IDS_RANGE);
 	}
 	return next;
 }
