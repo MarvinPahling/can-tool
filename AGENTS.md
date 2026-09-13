@@ -92,7 +92,7 @@ Import from the `src/commands` barrel (`index.ts`), not the individual files.
 
 ### Tauri backend structure
 
-`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 13 commands, and both `CanState` and `SimulationState` are `manage`d. `recording.rs` is the exception so far — pure capture-CSV helpers with no state and no commands yet.
+`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 16 commands, and `CanState`, `SimulationState` and `RecordingState` are all `manage`d.
 
 ## DBC feature
 
@@ -138,6 +138,17 @@ The `/visualize` route decodes incoming frames against the loaded DBC and shows 
 - `src/components/live-signal-value.tsx` — one signal row. The fade runs on the Web Animations API keyed on `changedAt`, keeping it off the React render path.
 - `src/components/live-message-card.tsx`, `visualize-settings-popover.tsx`, `live-traffic.tsx` — the card, the settings popover, and the view that folds frames into a ref and flushes to React at ~20 Hz. Note Base UI's `Slider` needs array values; a scalar makes it render two thumbs.
 - `src/routes/visualize.tsx` — thin route keeping the filter in the `q` search param.
+
+## Recording feature
+
+Live traffic can be written to a CSV capture, in the format the reference tool uses (`ignore/canable/src/canable/capture.py`) so the two are interchangeable — `src-tauri/fixtures/reference-capture.csv` holds 37 real recorded rows, and a test asserts our writer reproduces every one of them character for character. That test is the schema claim; without it "python-can compatible" would be an intention.
+
+- `src-tauri/src/recording.rs` — `frame_to_row` / `row_to_frame` / `check_header` are pure and hand-rolled (no `csv` crate: the format has no quoting, no embedded separators and no escapes). The formatting rules are exact and each is a way to be subtly wrong — epoch **seconds** at six decimals, an unpadded uppercase id, flags as `0`/`1`, the **resolved byte count** rather than the CAN FD nibble, lowercase payload hex.
+- Two shapes the format has and `CanFrame` does not. An **error frame** parses to `Ok(None)` rather than an error — rejecting it would let one noisy moment on the bus unload a whole recording, and it is the same "valid input, not a frame" contract `parse_slcan_frame` uses for adapter chatter. A **remote frame** requests a length it does not carry and `CanFrame` has nowhere to keep it, so it records as a remote frame of length zero; both are pinned by named tests rather than left as surprises.
+- `RecordingHandle` streams straight to a `BufWriter` from the reader thread. Frames are **never pooled in RAM** — the reference TUI (`ignore/canable/src/canable/tui.py:126,388`) appends every frame to a list and flushes on a button press, which is the same unbounded allocation the performance work exists to remove. The buffer is pushed to disk at least once a second so a crash costs a second of capture rather than 64 KiB of it.
+- **The counters live outside the sink's mutex.** `recording_status` is polled from the main thread and the reader holds that mutex across a buffered write — the same hazard `can.rs` documents for the serial port. Reading the status takes no lock the reader ever holds while writing.
+- `write_frames` returns nothing: the reader has nowhere to put an error, and a failing recording must not take the live view down with it. A write failure or a `max_frames`/`max_bytes` ceiling flushes, closes the sink and surfaces through `stopped_reason`, so a stopped capture is still a readable one. Ceilings are checked per frame, not per batch, so a limit stops the recording exactly where it says it does.
+- The reader takes its handle from the managed state via the `AppHandle` rather than having it threaded down through `open_connection`, and records **before** the `can-frames` emit: the capture is ground truth, the event stream is best-effort.
 
 ## Simulation feature
 

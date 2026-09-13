@@ -10,6 +10,7 @@ use serialport::{ClearBuffer, SerialPort, SerialPortType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dbc::{DbcMessage, DbcSignal};
+use crate::recording::RecordingState;
 use crate::simulation::SimulationState;
 
 /// USB identity of a CANable 2.0 running its default slcan firmware.
@@ -1074,6 +1075,11 @@ fn spawn_reader(
         let mut pending: Vec<CanFrame> = Vec::new();
         let mut last_flush = Instant::now();
         let clock = FrameClock::new();
+        // Taken from the managed state rather than threaded down through
+        // `open_connection`, and cloned once rather than looked up per batch.
+        // The `Arc` is what lets a recording start and stop mid-connection
+        // without disturbing this thread's lifecycle.
+        let recorder = Arc::clone(&app.state::<RecordingState>().handle);
 
         while !stop.load(Ordering::Relaxed) {
             match port.read(&mut raw) {
@@ -1085,6 +1091,11 @@ fn spawn_reader(
                     if batch.rejections > 0 {
                         let _ = app.emit("can-error", "Adapter rejected a frame");
                     }
+                    // Recorded before the emit, and unconditionally: the
+                    // capture is ground truth, the event stream is
+                    // best-effort. A recorder that only saw what the webview
+                    // saw would be useless for debugging the webview.
+                    recorder.write_frames(&batch.frames);
                     pending.extend(batch.frames);
                 }
                 // Timeouts are how an idle bus looks — keep waiting.

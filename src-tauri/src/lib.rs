@@ -9,6 +9,7 @@ use can::{
     CanState,
 };
 use dbc::parse_dbc_file;
+use recording::{recording_status, start_recording, stop_recording, RecordingState};
 use simulation::{simulation_status, start_simulation, stop_simulation, SimulationState};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
@@ -32,6 +33,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(CanState::default())
         .manage(SimulationState::default())
+        .manage(RecordingState::default())
         .invoke_handler(tauri::generate_handler![
             parse_dbc_file,
             list_can_devices,
@@ -46,6 +48,9 @@ pub fn run() {
             start_simulation,
             stop_simulation,
             simulation_status,
+            start_recording,
+            stop_recording,
+            recording_status,
         ])
         .menu(|handle| {
             // On macOS the *first* top-level submenu is always coerced into the

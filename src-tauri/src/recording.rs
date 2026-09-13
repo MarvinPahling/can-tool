@@ -25,6 +25,14 @@
 //! recording is otherwise undebuggable.
 
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tauri::State;
 
 use crate::can::{parse_hex, CanFrame, CAN_FD_DLC, MAX_EXTENDED_ID, MAX_STANDARD_ID};
 
@@ -209,6 +217,286 @@ pub fn row_to_frame(line: &str, line_no: usize) -> Result<Option<CanFrame>, Stri
         data,
         timestamp_ms: seconds * 1_000.0,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The recorder
+// ---------------------------------------------------------------------------
+
+/// Big enough that a busy bus costs a handful of `write` syscalls a second
+/// rather than one per frame.
+const RECORDING_BUFFER_BYTES: usize = 64 * 1024;
+
+/// How often the buffer is pushed to the disk regardless of how full it is, so
+/// a crash costs at most a second of capture rather than 64 KiB of it.
+const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Ceilings a recording stops itself at. Generous — roughly two hours of a
+/// saturated bus — but finite: a recording left running overnight must not
+/// fill the disk.
+const DEFAULT_MAX_FRAMES: u64 = 20_000_000;
+const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Why a recording that has written `frames`/`bytes` has to stop, if it does.
+pub(crate) fn ceiling_reached(
+    frames: u64,
+    bytes: u64,
+    max_frames: u64,
+    max_bytes: u64,
+) -> Option<String> {
+    if frames >= max_frames {
+        return Some(format!("Stopped at the {max_frames} frame limit"));
+    }
+    if bytes >= max_bytes {
+        return Some(format!("Stopped at the {max_bytes} byte size limit"));
+    }
+    None
+}
+
+/// The open file a recording writes through. Only the reader thread ever
+/// touches one.
+struct Sink {
+    writer: BufWriter<File>,
+    path: String,
+    last_flush: Instant,
+}
+
+impl Sink {
+    /// Opens the file and writes the header. Returns the header's size so the
+    /// caller's byte count starts out honest.
+    fn create(path: &str) -> Result<(Self, u64), String> {
+        let file = File::create(path).map_err(|e| format!("Cannot write {path}: {e}"))?;
+        let mut writer = BufWriter::with_capacity(RECORDING_BUFFER_BYTES, file);
+        let header = format!("{CAPTURE_HEADER}{CAPTURE_LINE_ENDING}");
+        writer
+            .write_all(header.as_bytes())
+            .map_err(|e| format!("Cannot write {path}: {e}"))?;
+
+        Ok((
+            Self {
+                writer,
+                path: path.to_string(),
+                last_flush: Instant::now(),
+            },
+            header.len() as u64,
+        ))
+    }
+
+    fn write_frame(&mut self, frame: &CanFrame) -> std::io::Result<u64> {
+        let row = frame_to_row(frame);
+        self.writer.write_all(row.as_bytes())?;
+        self.writer.write_all(CAPTURE_LINE_ENDING.as_bytes())?;
+        Ok((row.len() + CAPTURE_LINE_ENDING.len()) as u64)
+    }
+
+    fn flush_if_due(&mut self) {
+        if self.last_flush.elapsed() >= RECORDING_FLUSH_INTERVAL {
+            let _ = self.writer.flush();
+            self.last_flush = Instant::now();
+        }
+    }
+}
+
+/// A capture in progress.
+///
+/// The counters live outside the sink's mutex on purpose. `recording_status`
+/// is polled from the main thread, and the reader thread holds that mutex
+/// across a buffered disk write — the same hazard `can.rs` documents for the
+/// serial port, where a status poll must never be able to block behind I/O.
+/// Reading the status therefore takes no lock the reader ever holds while
+/// writing.
+///
+/// Only the reader thread mutates `frames`/`bytes`, so a plain load/store pair
+/// is sufficient; the atomics exist to make the *read* from another thread
+/// well-defined, not to make the update itself contended.
+pub struct RecordingHandle {
+    sink: Mutex<Option<Sink>>,
+    recording: AtomicBool,
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    /// Kept after a stop, so the UI can still say what was written where.
+    path: Mutex<Option<String>>,
+    /// Set only when the recorder stopped *itself* — a ceiling or a write
+    /// error. A deliberate stop leaves it empty.
+    stopped_reason: Mutex<Option<String>>,
+    max_frames: u64,
+    max_bytes: u64,
+}
+
+impl Default for RecordingHandle {
+    fn default() -> Self {
+        Self::with_limits(DEFAULT_MAX_FRAMES, DEFAULT_MAX_BYTES)
+    }
+}
+
+impl RecordingHandle {
+    pub(crate) fn with_limits(max_frames: u64, max_bytes: u64) -> Self {
+        Self {
+            sink: Mutex::new(None),
+            recording: AtomicBool::new(false),
+            frames: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            path: Mutex::new(None),
+            stopped_reason: Mutex::new(None),
+            max_frames,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn start(&self, path: &str) -> Result<(), String> {
+        let mut guard = self.sink.lock().map_err(|_| poisoned())?;
+        if guard.is_some() {
+            return Err("A recording is already running".to_string());
+        }
+
+        // Opened before anything is reset: a path that cannot be written must
+        // leave the recorder exactly as it was.
+        let (sink, header_bytes) = Sink::create(path)?;
+
+        self.frames.store(0, Ordering::Relaxed);
+        self.bytes.store(header_bytes, Ordering::Relaxed);
+        set(&self.path, Some(path.to_string()));
+        set(&self.stopped_reason, None);
+        self.recording.store(true, Ordering::Relaxed);
+        *guard = Some(sink);
+        Ok(())
+    }
+
+    /// Writes a batch straight through to the disk. Called from the reader
+    /// thread, ahead of the `can-frames` emit: the recording is ground truth,
+    /// the event stream is best-effort.
+    ///
+    /// Never returns an error — the reader has nowhere to put one, and a
+    /// recording that fails must not take the live view down with it. A
+    /// failure closes the sink and surfaces through `stopped_reason`.
+    pub(crate) fn write_frames(&self, frames: &[CanFrame]) {
+        if frames.is_empty() {
+            return;
+        }
+        let Ok(mut guard) = self.sink.lock() else {
+            return;
+        };
+        let Some(sink) = guard.as_mut() else {
+            return;
+        };
+
+        let mut written = self.frames.load(Ordering::Relaxed);
+        let mut bytes = self.bytes.load(Ordering::Relaxed);
+        let mut reason = None;
+
+        for frame in frames {
+            match sink.write_frame(frame) {
+                Ok(size) => {
+                    written += 1;
+                    bytes += size;
+                }
+                Err(e) => {
+                    reason = Some(format!("Stopped after a write error: {e}"));
+                    break;
+                }
+            }
+            // Checked per frame rather than per batch, so a ceiling stops the
+            // recording exactly where it says it does.
+            reason = ceiling_reached(written, bytes, self.max_frames, self.max_bytes);
+            if reason.is_some() {
+                break;
+            }
+        }
+
+        self.frames.store(written, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
+
+        if let Some(reason) = reason {
+            // Flushed on the way out, so a stopped recording is still a
+            // readable capture rather than a truncated one.
+            let _ = sink.writer.flush();
+            *guard = None;
+            self.recording.store(false, Ordering::Relaxed);
+            set(&self.stopped_reason, Some(reason));
+        } else {
+            sink.flush_if_due();
+        }
+    }
+
+    pub(crate) fn stop(&self) -> Result<RecordingSummary, String> {
+        let mut guard = self.sink.lock().map_err(|_| poisoned())?;
+        let Some(mut sink) = guard.take() else {
+            return Err("No recording is running".to_string());
+        };
+        self.recording.store(false, Ordering::Relaxed);
+
+        let flushed = sink.writer.flush();
+        let summary = RecordingSummary {
+            path: sink.path.clone(),
+            frames: self.frames.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        };
+        flushed.map_err(|e| format!("Cannot write {}: {e}", sink.path))?;
+        Ok(summary)
+    }
+
+    /// Deliberately takes no lock the reader holds while writing.
+    pub(crate) fn status(&self) -> RecordingStatus {
+        RecordingStatus {
+            recording: self.recording.load(Ordering::Relaxed),
+            path: get(&self.path),
+            frames: self.frames.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            stopped_reason: get(&self.stopped_reason),
+        }
+    }
+}
+
+fn poisoned() -> String {
+    "Recording state poisoned".to_string()
+}
+
+fn get(slot: &Mutex<Option<String>>) -> Option<String> {
+    slot.lock().ok().and_then(|value| value.clone())
+}
+
+fn set(slot: &Mutex<Option<String>>, value: Option<String>) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = value;
+    }
+}
+
+/// Managed state. Holds the handle behind an `Arc` so the reader thread can
+/// take its own reference and start/stop can work mid-connection.
+#[derive(Default)]
+pub struct RecordingState {
+    pub(crate) handle: Arc<RecordingHandle>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RecordingStatus {
+    pub recording: bool,
+    pub path: Option<String>,
+    pub frames: u64,
+    pub bytes: u64,
+    pub stopped_reason: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RecordingSummary {
+    pub path: String,
+    pub frames: u64,
+    pub bytes: u64,
+}
+
+#[tauri::command]
+pub fn start_recording(state: State<RecordingState>, path: String) -> Result<(), String> {
+    state.handle.start(&path)
+}
+
+#[tauri::command]
+pub fn stop_recording(state: State<RecordingState>) -> Result<RecordingSummary, String> {
+    state.handle.stop()
+}
+
+#[tauri::command]
+pub fn recording_status(state: State<RecordingState>) -> RecordingStatus {
+    state.handle.status()
 }
 
 #[cfg(test)]
@@ -441,6 +729,223 @@ mod tests {
     fn a_timestamp_survives_the_seconds_conversion() {
         let parsed = row_to_frame(REFERENCE_ROW, 1).unwrap().unwrap();
         assert_eq!(parsed.timestamp_ms, 1_787_839_203_108.521);
+    }
+
+    // ---- the recorder ----
+
+    fn temp_path() -> (tempfile::NamedTempFile, String) {
+        let file = tempfile::NamedTempFile::new().expect("a temp file");
+        let path = file.path().to_string_lossy().into_owned();
+        (file, path)
+    }
+
+    fn rows_of(path: &str) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .expect("the capture")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn ceiling_reached_is_none_below_both_limits() {
+        assert_eq!(ceiling_reached(9, 9, 10, 10), None);
+    }
+
+    #[test]
+    fn ceiling_reached_names_which_limit_was_hit() {
+        let frames = ceiling_reached(10, 0, 10, 100).expect("the frame ceiling");
+        assert!(frames.contains("frame"), "got: {frames}");
+
+        let bytes = ceiling_reached(0, 100, 10, 100).expect("the size ceiling");
+        assert!(
+            bytes.contains("size") || bytes.contains("byte"),
+            "got: {bytes}"
+        );
+    }
+
+    #[test]
+    fn a_recording_writes_the_header_ahead_of_the_first_frame() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::default();
+        handle.start(&path).unwrap();
+        handle.write_frames(&[frame(|_| {}), frame(|f| f.id = 0x272)]);
+        handle.stop().unwrap();
+
+        let rows = rows_of(&path);
+        check_header(&rows[0]).expect("the header comes first");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn frames_written_to_a_recording_parse_back() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::default();
+        handle.start(&path).unwrap();
+
+        let written = [
+            frame(|_| {}),
+            frame(|f| {
+                f.id = 0x18DA_F110;
+                f.extended = true;
+                f.fd = false;
+                f.bitrate_switch = false;
+                f.data = vec![0xAA, 0xBB];
+            }),
+        ];
+        handle.write_frames(&written);
+        handle.stop().unwrap();
+
+        let rows = rows_of(&path);
+        let parsed: Vec<CanFrame> = rows[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, row)| row_to_frame(row, i + 2).unwrap().unwrap())
+            .collect();
+        assert_eq!(parsed, written);
+    }
+
+    #[test]
+    fn stopping_flushes_the_buffer() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::default();
+        handle.start(&path).unwrap();
+        handle.write_frames(&[frame(|_| {})]);
+
+        // A 64 KiB BufWriter has not touched the disk yet.
+        assert_eq!(rows_of(&path).len(), 0, "nothing should be flushed yet");
+
+        let summary = handle.stop().unwrap();
+        assert_eq!(
+            rows_of(&path).len(),
+            2,
+            "the last frame must reach the disk"
+        );
+        assert_eq!(summary.frames, 1);
+        assert_eq!(summary.path, path);
+    }
+
+    #[test]
+    fn starting_twice_is_refused() {
+        let (_temp, first) = temp_path();
+        let (_temp2, second) = temp_path();
+        let handle = RecordingHandle::default();
+        handle.start(&first).unwrap();
+
+        assert!(handle.start(&second).is_err());
+        assert_eq!(
+            handle.status().path.as_deref(),
+            Some(first.as_str()),
+            "the running recording must not be swapped out from under itself"
+        );
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_opened_fails_before_any_state_is_touched() {
+        let handle = RecordingHandle::default();
+        let err = handle
+            .start("/nonexistent-directory/capture.csv")
+            .unwrap_err();
+
+        assert!(
+            err.contains("capture.csv"),
+            "the error should name the path, got: {err}"
+        );
+        let status = handle.status();
+        assert!(!status.recording);
+        assert_eq!(status.path, None);
+    }
+
+    #[test]
+    fn stopping_without_a_recording_is_refused() {
+        assert!(RecordingHandle::default().stop().is_err());
+    }
+
+    #[test]
+    fn writing_without_a_recording_is_a_no_op() {
+        let handle = RecordingHandle::default();
+        handle.write_frames(&[frame(|_| {})]);
+        assert_eq!(handle.status().frames, 0);
+    }
+
+    #[test]
+    fn the_frame_ceiling_stops_the_recording_and_leaves_a_valid_file() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::with_limits(3, u64::MAX);
+        handle.start(&path).unwrap();
+        handle.write_frames(&vec![frame(|_| {}); 5]);
+
+        let status = handle.status();
+        assert!(!status.recording, "the ceiling must stop the recording");
+        assert_eq!(status.frames, 3, "and stop it exactly at the limit");
+        assert!(
+            status.stopped_reason.unwrap_or_default().contains("frame"),
+            "the UI has to be able to say why it stopped"
+        );
+
+        // Stopped, not corrupted: the file is still a capture.
+        let rows = rows_of(&path);
+        check_header(&rows[0]).unwrap();
+        assert_eq!(rows.len(), 4);
+        for (i, row) in rows[1..].iter().enumerate() {
+            row_to_frame(row, i + 2).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_size_ceiling_stops_the_recording() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::with_limits(u64::MAX, 200);
+        handle.start(&path).unwrap();
+        handle.write_frames(&vec![frame(|_| {}); 20]);
+
+        let status = handle.status();
+        assert!(!status.recording);
+        assert!(status.frames > 0 && status.frames < 20);
+        assert!(status.bytes >= 200);
+    }
+
+    #[test]
+    fn the_status_reports_progress_and_survives_the_stop() {
+        let (_temp, path) = temp_path();
+        let handle = RecordingHandle::default();
+        handle.start(&path).unwrap();
+        handle.write_frames(&[frame(|_| {}), frame(|_| {})]);
+
+        let running = handle.status();
+        assert!(running.recording);
+        assert_eq!(running.frames, 2);
+        assert!(running.bytes > 0);
+        assert_eq!(running.path.as_deref(), Some(path.as_str()));
+
+        handle.stop().unwrap();
+        let stopped = handle.status();
+        assert!(!stopped.recording);
+        assert_eq!(
+            stopped.frames, 2,
+            "the UI still has to say what was written"
+        );
+        assert_eq!(stopped.path.as_deref(), Some(path.as_str()));
+        assert_eq!(
+            stopped.stopped_reason, None,
+            "a deliberate stop has no reason"
+        );
+    }
+
+    #[test]
+    fn a_new_recording_clears_the_previous_run() {
+        let (_temp, first) = temp_path();
+        let (_temp2, second) = temp_path();
+        let handle = RecordingHandle::with_limits(1, u64::MAX);
+        handle.start(&first).unwrap();
+        handle.write_frames(&[frame(|_| {}), frame(|_| {})]);
+        assert!(handle.status().stopped_reason.is_some());
+
+        handle.start(&second).unwrap();
+        let status = handle.status();
+        assert_eq!(status.frames, 0);
+        assert_eq!(status.stopped_reason, None, "a stale reason would be a lie");
+        assert_eq!(status.path.as_deref(), Some(second.as_str()));
     }
 
     #[test]
