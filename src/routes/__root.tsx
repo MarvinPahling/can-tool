@@ -4,12 +4,11 @@ import {
 	Link,
 	Outlet,
 } from "@tanstack/react-router";
-import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import { CommandsProvider } from "@/commands";
 import { DeviceConnectDialog } from "@/components/device-connect-dialog";
+import { RouterDevtools } from "@/components/devtools";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
 import { Titlebar } from "@/components/titlebar";
-import { perfFlags } from "@/lib/perf-flags";
 
 interface RouterContext {
 	queryClient: QueryClient;
@@ -36,10 +35,7 @@ function RootComponent() {
 				<div className="flex-1 overflow-auto">
 					<Outlet />
 				</div>
-				{/* See the note in `main.tsx`. */}
-				{perfFlags.devtools && (
-					<TanStackRouterDevtools position="bottom-right" />
-				)}
+				<RouterDevtools />
 			</div>
 			<ShortcutsDialog />
 			<DeviceConnectDialog />
