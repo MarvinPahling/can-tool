@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runCommand } from "@/commands";
+import { CaptureBar } from "@/components/capture-bar";
 import { LiveMessageCard } from "@/components/live-message-card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -13,6 +14,7 @@ import {
 } from "@/lib/live-messages";
 import { useCanFrames, useConnectionStatus } from "@/queries/can";
 import { useCurrentDbc } from "@/queries/dbc";
+import { useReplayStatus } from "@/queries/recording";
 
 /**
  * How often decoded state is handed to React. The backend already batches to
@@ -48,6 +50,7 @@ export function LiveTraffic({
 }) {
 	const dbc = useCurrentDbc();
 	const status = useConnectionStatus();
+	const replay = useReplayStatus();
 	const { settings } = useVisualizeSettings();
 
 	const stateRef = useRef<LiveState>(new Map());
@@ -82,36 +85,49 @@ export function LiveTraffic({
 		[messages, filter],
 	);
 
-	if (!dbcFile) {
-		return (
-			<Alert>
-				<AlertTitle>No DBC loaded</AlertTitle>
-				<AlertDescription className="flex flex-col items-start gap-2">
-					Open a .dbc file so incoming frames can be decoded.
-					<Button size="sm" onClick={() => runCommand("file.open")}>
-						Open DBC file
-					</Button>
-				</AlertDescription>
-			</Alert>
-		);
-	}
+	// A replay is a frame source in its own right — that is the whole point of
+	// it — so "connected" here means "something is producing frames", not
+	// "an adapter is plugged in".
+	const hasSource = Boolean(status.data) || Boolean(replay.data?.running);
 
-	if (!status.data) {
+	const guard = !dbcFile ? (
+		<Alert>
+			<AlertTitle>No DBC loaded</AlertTitle>
+			<AlertDescription className="flex flex-col items-start gap-2">
+				Open a .dbc file so incoming frames can be decoded.
+				<Button size="sm" onClick={() => runCommand("file.open")}>
+					Open DBC file
+				</Button>
+			</AlertDescription>
+		</Alert>
+	) : !hasSource ? (
+		<Alert>
+			<AlertTitle>No frames arriving</AlertTitle>
+			<AlertDescription className="flex flex-col items-start gap-2">
+				Connect a CAN adapter, or replay a recorded capture with the controls
+				above.
+				<Button size="sm" onClick={() => runCommand("device.connect")}>
+					Connect device…
+				</Button>
+			</AlertDescription>
+		</Alert>
+	) : null;
+
+	// Rendered above the guard, not inside it: replaying a capture is how you
+	// get frames without an adapter, so the control that starts one cannot be
+	// hidden behind "not connected".
+	if (guard) {
 		return (
-			<Alert>
-				<AlertTitle>Not connected</AlertTitle>
-				<AlertDescription className="flex flex-col items-start gap-2">
-					Connect a CAN adapter to start receiving frames.
-					<Button size="sm" onClick={() => runCommand("device.connect")}>
-						Connect device…
-					</Button>
-				</AlertDescription>
-			</Alert>
+			<div className="flex flex-col gap-3">
+				<CaptureBar />
+				{guard}
+			</div>
 		);
 	}
 
 	return (
 		<div className="flex flex-col gap-3">
+			<CaptureBar />
 			<div className="flex items-center gap-2">
 				<Input
 					value={filter}

@@ -4,21 +4,30 @@ import type { CanFrame } from "@/api/can";
 import { makeDbcFile, makeMessage, makeSignal } from "@/test/fixtures";
 import { LiveTraffic } from "./live-traffic";
 
-const { emitFrames, useCanFrames, useConnectionStatus, useCurrentDbc } =
-	vi.hoisted(() => {
-		let handler: ((frames: unknown[]) => void) | undefined;
-		return {
-			useCanFrames: vi.fn((cb: (frames: unknown[]) => void) => {
-				handler = cb;
-			}),
-			useConnectionStatus: vi.fn(),
-			useCurrentDbc: vi.fn(),
-			emitFrames: (frames: CanFrame[]) => handler?.(frames),
-		};
-	});
+const {
+	emitFrames,
+	useCanFrames,
+	useConnectionStatus,
+	useCurrentDbc,
+	useReplayStatus,
+} = vi.hoisted(() => {
+	let handler: ((frames: unknown[]) => void) | undefined;
+	return {
+		useCanFrames: vi.fn((cb: (frames: unknown[]) => void) => {
+			handler = cb;
+		}),
+		useConnectionStatus: vi.fn(),
+		useCurrentDbc: vi.fn(),
+		useReplayStatus: vi.fn(),
+		emitFrames: (frames: CanFrame[]) => handler?.(frames),
+	};
+});
 
 vi.mock("@/queries/can", () => ({ useCanFrames, useConnectionStatus }));
 vi.mock("@/queries/dbc", () => ({ useCurrentDbc }));
+vi.mock("@/queries/recording", () => ({ useReplayStatus }));
+// The capture controls have their own test; here they are only in the way.
+vi.mock("./capture-bar", () => ({ CaptureBar: () => null }));
 
 const dbc = makeDbcFile({
 	messages: [
@@ -65,6 +74,7 @@ beforeEach(() => {
 	useConnectionStatus.mockReturnValue({
 		data: { port_name: "tty", bitrate: 5e5 },
 	});
+	useReplayStatus.mockReturnValue({ data: { running: false } });
 });
 
 afterEach(() => {
@@ -80,11 +90,24 @@ describe("LiveTraffic", () => {
 		expect(screen.getByText(/no dbc/i)).toBeInTheDocument();
 	});
 
-	it("prompts to connect when there is no device", () => {
+	it("prompts to connect when nothing is producing frames", () => {
 		useConnectionStatus.mockReturnValue({ data: null });
 		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
 
-		expect(screen.getByText(/not connected/i)).toBeInTheDocument();
+		expect(screen.getByText(/no frames arriving/i)).toBeInTheDocument();
+	});
+
+	it("renders the grid during a replay with no device connected", () => {
+		// The whole point of the harness: frames with nothing plugged in. If the
+		// guard only knew about adapters, a replay would render an alert.
+		useConnectionStatus.mockReturnValue({ data: null });
+		useReplayStatus.mockReturnValue({ data: { running: true } });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		expect(screen.queryByText(/no frames arriving/i)).not.toBeInTheDocument();
+
+		deliver([frame()]);
+		expect(screen.getByText("Speed")).toBeInTheDocument();
 	});
 
 	it("waits quietly until the first frame arrives", () => {
