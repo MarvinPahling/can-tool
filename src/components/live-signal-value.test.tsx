@@ -165,3 +165,15 @@ describe("LiveSignalValue", () => {
 		expect(options.easing).toBe("steps(1, end)");
 	});
 });
+
+describe("LiveSignalValue memoization", () => {
+	it("is memoized", () => {
+		// Structural rather than behavioural: the row has no component child
+		// to count renders through. What makes the memo *effective* — that
+		// `applyFrames` returns an unchanged `LiveSignal` by identity — is
+		// covered in `live-messages.test.ts` under "referential stability".
+		expect((LiveSignalValue as unknown as { $$typeof: symbol }).$$typeof).toBe(
+			Symbol.for("react.memo"),
+		);
+	});
+});

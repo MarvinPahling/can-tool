@@ -125,7 +125,16 @@ export function useGenerateChecksum() {
  * and pushing every batch through `setState` would undo that. Consumers keep
  * their own accumulator and flush on their own schedule.
  */
-export function useCanFrames(onBatch: (batch: CanFrameBatch) => void) {
+export function useCanFrames(
+	onBatch: (batch: CanFrameBatch) => void,
+	/**
+	 * Set false to stop listening entirely. Hooks cannot be conditional, but a
+	 * page showing "no DBC loaded" was still folding every frame into a state
+	 * map nothing rendered — growing it the whole time with nothing on screen
+	 * to hint at it.
+	 */
+	enabled = true,
+) {
 	// The callback lives in a ref so a new identity each render does not tear
 	// down and re-register the listener, which would drop frames in the gap.
 	const handler = useRef(onBatch);
@@ -134,6 +143,7 @@ export function useCanFrames(onBatch: (batch: CanFrameBatch) => void) {
 	});
 
 	useEffect(() => {
+		if (!enabled) return;
 		let cancelled = false;
 		let unlisten: (() => void) | undefined;
 
@@ -152,7 +162,7 @@ export function useCanFrames(onBatch: (batch: CanFrameBatch) => void) {
 			cancelled = true;
 			unlisten?.();
 		};
-	}, []);
+	}, [enabled]);
 }
 
 /**

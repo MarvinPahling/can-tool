@@ -63,6 +63,8 @@ export function LiveTraffic({
 	const receivedRef = useRef({ frames: 0, batches: 0 });
 	const droppedRef = useRef(0);
 	const evictedRef = useRef(0);
+	const orderRef = useRef<number[]>([]);
+	const orderDirtyRef = useRef(false);
 	const [messages, setMessages] = useState<LiveMessage[]>([]);
 	const [dropped, setDropped] = useState(0);
 	const [evicted, setEvicted] = useState(0);
@@ -73,6 +75,14 @@ export function LiveTraffic({
 	// signals) and does not depend on the frames at all.
 	const index = useMemo(() => buildMessageIndex(dbcFile), [dbcFile]);
 
+	// A replay is a frame source in its own right — that is the whole point of
+	// it — so "connected" here means "something is producing frames", not "an
+	// adapter is plugged in".
+	const hasSource = Boolean(status.data) || Boolean(replay.data?.running);
+	// Decided before the subscription rather than after it: everything below
+	// stops when there is nothing to show it on.
+	const showing = Boolean(dbcFile) && hasSource;
+
 	useCanFrames((batch) => {
 		const result = applyFrames(
 			stateRef.current,
@@ -82,11 +92,15 @@ export function LiveTraffic({
 			settings.maxLiveIds,
 		);
 		evictedRef.current += result.evicted;
+		// The map is kept in recency order for eviction, so the display order
+		// has to be sorted — but only when the id set actually moved.
+		if (result.inserted > 0 || result.evicted > 0) orderDirtyRef.current = true;
+
 		dirtyRef.current = true;
 		receivedRef.current.frames += batch.frames.length;
 		receivedRef.current.batches += 1;
 		droppedRef.current += batch.dropped;
-	});
+	}, showing);
 
 	// The adapter refusing a transmit has been reported since the reader thread
 	// was written, with nothing listening. This is the first consumer.
@@ -107,30 +121,42 @@ export function LiveTraffic({
 	useEffect(() => {
 		stateRef.current = new Map();
 		evictedRef.current = 0;
+		orderRef.current = [];
+		orderDirtyRef.current = false;
 		setMessages([]);
 		setEvicted(0);
 	}, [dbcFile]);
 
 	useEffect(() => {
+		if (!showing) return;
 		const id = setInterval(() => {
 			if (!dirtyRef.current) return;
 			dirtyRef.current = false;
-			setMessages([...stateRef.current.values()].sort((a, b) => a.id - b.id));
+
+			if (orderDirtyRef.current) {
+				orderDirtyRef.current = false;
+				orderRef.current = [...stateRef.current.keys()].sort((a, b) => a - b);
+			}
+
+			// Mapped rather than spread-and-sorted: the sort is what costs, and
+			// the order only changes when an id appears or is evicted.
+			const next: LiveMessage[] = [];
+			for (const id of orderRef.current) {
+				const live = stateRef.current.get(id);
+				if (live) next.push(live);
+			}
+
+			setMessages(next);
 			setDropped(droppedRef.current);
 			setEvicted(evictedRef.current);
 		}, RENDER_INTERVAL_MS);
 		return () => clearInterval(id);
-	}, []);
+	}, [showing]);
 
 	const visible = useMemo(
 		() => messages.filter((live) => matchesFilter(live, filter)),
 		[messages, filter],
 	);
-
-	// A replay is a frame source in its own right — that is the whole point of
-	// it — so "connected" here means "something is producing frames", not "an
-	// adapter is plugged in".
-	const hasSource = Boolean(status.data) || Boolean(replay.data?.running);
 
 	const guard = !dbcFile ? (
 		<Alert>

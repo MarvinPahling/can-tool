@@ -16,8 +16,10 @@ const {
 	let handler: ((batch: unknown) => void) | undefined;
 	let errorHandler: ((event: unknown) => void) | undefined;
 	return {
-		useCanFrames: vi.fn((cb: (batch: unknown) => void) => {
-			handler = cb;
+		useCanFrames: vi.fn((cb: (batch: unknown) => void, enabled = true) => {
+			// Only a live subscription reaches the fold; a disabled one must
+			// not, or the state grows behind a guard nothing renders from.
+			handler = enabled ? cb : undefined;
 		}),
 		useCanError: vi.fn((cb: (event: unknown) => void) => {
 			errorHandler = cb;
@@ -70,6 +72,12 @@ function frame(overrides: Partial<CanFrame> = {}): CanFrame {
 }
 
 /** Pushes frames in, then lets the render-flush interval fire. */
+/** Whether the most recent `useCanFrames` call asked to be subscribed. */
+function lastEnabled(): boolean | undefined {
+	const calls = useCanFrames.mock.calls;
+	return calls[calls.length - 1]?.[1];
+}
+
 function deliver(frames: CanFrame[], dropped = 0) {
 	act(() => {
 		emitFrames(frames, dropped);
@@ -211,5 +219,45 @@ describe("LiveTraffic", () => {
 		expect(
 			screen.getByText(/7 transmitted frames were refused/),
 		).toBeInTheDocument();
+	});
+
+	it("does not fold frames while the no-DBC guard is showing", () => {
+		// The hooks run before the guard is decided, so without switching the
+		// subscription off the map grew the whole time a static alert was on
+		// screen, with nothing to hint at it.
+		useCurrentDbc.mockReturnValue({ data: undefined });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(lastEnabled()).toBe(false);
+	});
+
+	it("does not fold frames while nothing is producing them", () => {
+		useConnectionStatus.mockReturnValue({ data: null });
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame()]);
+
+		expect(lastEnabled()).toBe(false);
+	});
+
+	it("folds frames once there is a DBC and a source", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+		expect(lastEnabled()).toBe(true);
+	});
+
+	it("keeps the cards in id order as new ids appear", () => {
+		render(<LiveTraffic filter="" onFilterChange={() => {}} />);
+
+		deliver([frame({ id: 0x2b0 })]);
+		deliver([frame({ id: 0x1a0 })]);
+
+		// The state map is kept in recency order for eviction, so the display
+		// order is sorted separately — and only when the id set moves.
+		const names = screen
+			.getAllByText(/^(Speed|Brake)$/)
+			.map((node) => node.textContent);
+		expect(names).toEqual(["Speed", "Brake"]);
 	});
 });

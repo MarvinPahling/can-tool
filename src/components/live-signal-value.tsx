@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import type { DbcSignal } from "@/api/dbc";
 import type { LiveSignal } from "@/lib/live-messages";
 import { cn } from "@/lib/utils";
@@ -36,8 +36,12 @@ function prefersReducedMotion(): boolean {
  * a second, and driving the colour through render would put the whole page's
  * frame budget behind it. Here the effect fires once per change and the
  * compositor does the rest.
+ *
+ * Memoized, which is only worth anything because `applyFrames` returns an
+ * unchanged `LiveSignal` by identity: a message with twenty signals where two
+ * moved re-renders two rows, not twenty.
  */
-export function LiveSignalValue({
+export const LiveSignalValue = memo(function LiveSignalValue({
 	signal,
 	live,
 	settings,
@@ -99,4 +103,4 @@ export function LiveSignalValue({
 			</span>
 		</div>
 	);
-}
+});
