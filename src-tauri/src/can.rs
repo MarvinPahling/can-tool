@@ -124,18 +124,61 @@ struct CanConnection {
     status: CanConnectionStatus,
     /// Signals the reader thread to exit; see `stop_reader`.
     stop: Arc<AtomicBool>,
+    /// Set by the reader when the port stops answering — unplugged, or closed
+    /// underneath us. Shared rather than reported through `CanState`, because
+    /// the reader must never take that mutex: `stop_reader` is called *while
+    /// holding it*, so a reader that wanted it during teardown would deadlock.
+    lost: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
 }
 
+/// Signals a reader thread and waits for it to exit, so a reconnect can never
+/// leave a second thread reading the same port.
+///
+/// Free-standing and taking the two fields it needs, so it can be tested
+/// without a serial port. Taking the handle is what makes it idempotent —
+/// `Drop` runs it again after `disconnect_can_device` already has.
+fn stop_reader(stop: &Arc<AtomicBool>, reader: &mut Option<JoinHandle<()>>) {
+    stop.store(true, Ordering::Relaxed);
+    if let Some(reader) = reader.take() {
+        // `unpark` is not needed: the reader blocks in `read`, bounded by
+        // `RX_READ_TIMEOUT`, so the join is short by construction.
+        let _ = reader.join();
+    }
+}
+
+/// Whether the reader has reported its port gone.
+fn connection_lost(lost: &Arc<AtomicBool>) -> bool {
+    lost.load(Ordering::Relaxed)
+}
+
+/// The connection, if there is one still answering.
+///
+/// A `CanConnection` whose reader has died is not one. Every caller that asks
+/// "is a device attached?" must go through here, or they disagree: the status
+/// would report disconnected after an unplug while `ensure_no_device` still
+/// refused to start a replay, leaving no way forward without a restart.
+fn active(guard: &Option<CanConnection>) -> Option<&CanConnection> {
+    guard.as_ref().filter(|c| !connection_lost(&c.lost))
+}
+
 impl CanConnection {
-    /// Stops the reader thread and waits for it to exit, so a reconnect can
-    /// never leave a second thread reading the same port. The join costs at
-    /// most one read timeout.
     fn stop_reader(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        stop_reader(&self.stop, &mut self.reader);
+    }
+}
+
+/// The leak this closes: three paths dropped a `CanConnection` without
+/// stopping its thread — the sweep's reconnect overwriting the slot, and a
+/// poisoned-lock `?` after the thread was already spawned. A leaked reader
+/// owns a `try_clone`d descriptor, so closing the connection's own port does
+/// not end it; it runs until the process does, keeps emitting `can-frames`
+/// into a second interleaved stream, and holds a cloned `AppHandle` that pins
+/// the whole `AppManager` — every managed state and every window. Doing this
+/// in `Drop` closes all three by construction rather than by remembering.
+impl Drop for CanConnection {
+    fn drop(&mut self) {
+        self.stop_reader();
     }
 }
 
@@ -315,14 +358,22 @@ fn open_connection(
     configure_channel(&mut port, candidate, read_only)?;
 
     // The reader gets its own handle so it never contends with the writer.
-    let rx_port = port
+    let mut rx_port = port
         .try_clone()
         .map_err(|e| format!("Failed to open a read handle on {port_name}: {e}"))?;
 
+    // And its own, much shorter read timeout. The writer keeps
+    // `SERIAL_TIMEOUT`, where a blocking write genuinely needs the headroom;
+    // on this handle it only decides how long a stop waits for the loop to
+    // come back around, and how long a part-filled batch sits on an idle bus.
+    let _ = rx_port.set_timeout(RX_READ_TIMEOUT);
+
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = spawn_reader(app, rx_port, Arc::clone(&stop));
+    let lost = Arc::new(AtomicBool::new(false));
+    let reader = spawn_reader(app, rx_port, Arc::clone(&stop), Arc::clone(&lost));
     Ok(CanConnection {
         port,
+        lost,
         status: CanConnectionStatus {
             port_name: port_name.to_string(),
             bitrate: candidate.bitrate,
@@ -615,7 +666,10 @@ pub fn can_connection_status(
         .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
-    Ok(guard.as_ref().map(|c| c.status.clone()))
+
+    // The stale `CanConnection` behind a lost port is cleaned up by the next
+    // connect or disconnect; until then it simply is not reported.
+    Ok(active(&guard).map(|c| c.status.clone()))
 }
 
 /// Returns the raw DBC bit indices occupied by a signal, matching
@@ -980,6 +1034,12 @@ pub(crate) const RX_PENDING_CAP: usize = 1024;
 /// How often adapter rejections are reported, at most.
 const RX_ERROR_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Read timeout on the reader's handle, well below the writer's
+/// `SERIAL_TIMEOUT`. `stop` is only checked between reads, so this is what a
+/// join actually costs — half a second of it made every connect and
+/// disconnect visibly stall the window.
+const RX_READ_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Guards against unbounded growth if the adapter ever streams bytes with no
 /// line terminator in sight.
 const RX_BUFFER_LIMIT: usize = 4096;
@@ -1137,6 +1197,7 @@ fn spawn_reader(
     app: AppHandle,
     mut port: Box<dyn SerialPort>,
     stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut raw = [0u8; 1024];
@@ -1172,7 +1233,12 @@ fn spawn_reader(
                 // Timeouts are how an idle bus looks — keep waiting.
                 Err(e) if e.kind() == ErrorKind::TimedOut => {}
                 // Anything else means the port is gone (unplugged, closed).
-                Err(_) => break,
+                // Say so: the reader is the only thing that finds out, and
+                // without this the page keeps claiming a live connection.
+                Err(_) => {
+                    lost.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
 
             if should_report_rejections(rejections, last_report.elapsed()) {
@@ -1187,6 +1253,11 @@ fn spawn_reader(
                 dropped = 0;
                 last_flush = Instant::now();
             }
+        }
+
+        // Whatever ended the loop, the frames already parsed are real.
+        if !pending.is_empty() {
+            emit_frames(&app, &pending, dropped);
         }
     })
 }
@@ -1219,7 +1290,7 @@ pub(crate) fn ensure_no_device(state: &CanState) -> Result<(), String> {
         .connection
         .lock()
         .map_err(|_| "CAN state poisoned".to_string())?;
-    if guard.is_some() {
+    if active(&guard).is_some() {
         return Err(
             "A CAN device is connected; disconnect it before replaying a capture".to_string(),
         );
@@ -2017,6 +2088,59 @@ mod tests {
         let batch = drain_lines(&mut buf, || 0.0);
         assert!(batch.frames.is_empty());
         assert_eq!(buf, "t1A01F", "the buffer is left untouched");
+    }
+
+    /// A stand-in for the reader: it watches the real stop flag, so these
+    /// exercise the real teardown rather than a mocked one.
+    fn fake_reader(stop: &Arc<AtomicBool>) -> JoinHandle<()> {
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    }
+
+    #[test]
+    fn stop_reader_signals_and_joins() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Some(fake_reader(&stop));
+
+        stop_reader(&stop, &mut reader);
+
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(
+            reader.is_none(),
+            "the handle must be taken, not left behind"
+        );
+    }
+
+    #[test]
+    fn stop_reader_is_idempotent() {
+        // `Drop` runs it again after `disconnect_can_device` already has.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Some(fake_reader(&stop));
+
+        stop_reader(&stop, &mut reader);
+        stop_reader(&stop, &mut reader);
+    }
+
+    #[test]
+    fn stop_reader_copes_with_a_connection_that_never_spawned_one() {
+        let stop = Arc::new(AtomicBool::new(false));
+        stop_reader(&stop, &mut None);
+    }
+
+    #[test]
+    fn a_connection_whose_reader_died_reports_itself_disconnected() {
+        // The reader is the only thing that knows the port is gone. Without
+        // this, unplugging the adapter leaves `can_connection_status`
+        // claiming a healthy connection forever.
+        let lost = Arc::new(AtomicBool::new(false));
+        assert!(!connection_lost(&lost));
+
+        lost.store(true, Ordering::Relaxed);
+        assert!(connection_lost(&lost));
     }
 
     #[test]
