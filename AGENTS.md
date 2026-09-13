@@ -92,7 +92,7 @@ Import from the `src/commands` barrel (`index.ts`), not the individual files.
 
 ### Tauri backend structure
 
-`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`, `replay.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 19 commands, and `CanState`, `SimulationState`, `RecordingState` and `ReplayState` are all `manage`d.
+`src-tauri/src/lib.rs` wires plugins, the native menu (macOS app/File/Edit menus, built with `tauri::menu`, forwarding clicks to the frontend as a `menu-command` event whose payload is a command id from `src/commands/definitions.ts`), and the `invoke_handler![...]` command registry — this is the map of everything callable from the frontend. Domain logic is split into modules (`dbc.rs`, `can.rs`, `simulation.rs`, `recording.rs`, `replay.rs`, `generator.rs`) each exposing `#[tauri::command]` functions and any managed state structs; the registry holds 20 commands, and `CanState`, `SimulationState`, `RecordingState` and `ReplayState` are all `manage`d. `generator.rs` holds no state — it is a pure writer.
 
 ## DBC feature
 
@@ -162,6 +162,17 @@ A recorded capture can be played back as a **virtual CAN source**, with no adapt
 - **One source of `can-frames` at a time.** `start_replay` refuses while a device is connected (`can::ensure_no_device`) and `connect_can_device`/`autodetect_bitrate` refuse while a replay runs (`replay::ensure_not_replaying`). Two sources interleaved would make every frame count and every memory measurement meaningless. `start_replay` holds neither lock while checking the other, so nothing nests and the `SimulationState`-before-`CanState` rule is untouched.
 - The file is parsed **atomically** before any state is touched (`recording::parse_capture`): one bad row fails the start with its line number and nothing emitted, the posture `validate_entries` takes. `MAX_REPLAY_FRAMES` is a memory bound rather than a format rule — frames stay in RAM for the whole run — and is deliberately lower than the recorder's own ceiling, since a recording is for analysis as well as replay.
 - Note typegen now emits an `onCanFrames` helper into `src/generated/events.ts` typed `payload: unknown`, because it sees the `app.emit` call site here. It is as unusable as the rest of that file; `src/api/can.ts` keeps the hand-written `CanFrame`.
+
+## Synthetic captures
+
+`generate_capture(path, spec)` (`src-tauri/src/generator.rs`) writes a capture without a bus, so the two shapes that break `/visualize` can be produced on demand instead of waited for: thousands of distinct 29-bit ids, and a sustained frame rate high enough to keep the main thread behind the emit queue.
+
+- **Everything derives from `spec.seed`**, including the first timestamp (`SYNTHETIC_EPOCH_MS`, a fixed point — a capture's absolute date means nothing to a replay, which works off deltas). Two runs of one spec produce byte-identical files, and a before/after measurement is only a measurement if both runs saw the same traffic. That is also why the RNG is a hand-rolled xorshift rather than a `rand` dependency.
+- Frames are emitted **round-robin, one per `slot_ms`** (`cycle_ms / id_count`), which makes the sequence sorted by construction — no buffer of a million frames waiting to be sorted, and the write streams. The frame rate is `id_count * 1000 / cycle_ms`.
+- `fd_ratio` and `brs_ratio` are taken from the **head of the id list** rather than sampled, so the ratio is exact and a test asserts a count rather than a distribution. `brs_ratio` is a fraction of the *FD* ids: BRS does not exist without FD.
+- **`churn` is not cosmetic.** A capture of unchanging payloads never trips `hasSignificantChange`, so it never creates a highlight animation and exercises none of the render path under suspicion. Static traffic would flatter every measurement.
+- `from_dbc` takes ids and payload layouts from a real DBC and picks each value through `signal_range` — the derived range, not the DBC's declared min/max, which reverse-engineered files routinely leave as a placeholder. It then encodes through `encode_can_message`, so one encoder stays authoritative. With it set, `id_count` is capped at the message count and `extended` is ignored — the DBC decides.
+- `validate_spec` is pure and runs before the file is created, so a bad spec never leaves an empty capture behind. An `id_count` past the 11-bit space is refused with a message that points at `extended`.
 
 ## Simulation feature
 

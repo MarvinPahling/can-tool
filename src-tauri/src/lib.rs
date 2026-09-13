@@ -1,5 +1,6 @@
 mod can;
 mod dbc;
+pub mod generator;
 pub mod recording;
 pub mod replay;
 pub mod simulation;
@@ -10,6 +11,7 @@ use can::{
     CanState,
 };
 use dbc::parse_dbc_file;
+use generator::generate_capture;
 use recording::{recording_status, start_recording, stop_recording, RecordingState};
 use replay::{replay_status, start_replay, stop_replay, ReplayState};
 use simulation::{simulation_status, start_simulation, stop_simulation, SimulationState};
@@ -57,6 +59,7 @@ pub fn run() {
             start_replay,
             stop_replay,
             replay_status,
+            generate_capture,
         ])
         .menu(|handle| {
             // On macOS the *first* top-level submenu is always coerced into the

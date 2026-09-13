@@ -643,7 +643,7 @@ fn signal_bit_indices(start_bit: u64, size: u64, little_endian: bool) -> Vec<u64
 /// min/max. Reverse-engineered DBC files (e.g. opendbc-style) very commonly
 /// leave min/max as an unreliable placeholder like `0|1` regardless of bit
 /// width, so trusting them would reject values that are perfectly encodable.
-fn signal_range(signal: &DbcSignal) -> (f64, f64) {
+pub(crate) fn signal_range(signal: &DbcSignal) -> (f64, f64) {
     if signal.signed {
         let min_raw = -(1i64 << (signal.size - 1));
         let max_raw = (1i64 << (signal.size - 1)) - 1;
