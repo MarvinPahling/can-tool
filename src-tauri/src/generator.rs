@@ -199,9 +199,9 @@ struct Profile {
 /// Derived from `signal_range` rather than the DBC's declared min/max, which
 /// reverse-engineered files routinely leave as a placeholder — the same reason
 /// `encode_can_message` validates against the derived range.
-fn value_in_range(signal: &DbcSignal, rng: &mut Rng) -> f64 {
-    let (min, max) = signal_range(signal);
-    min + (max - min) * rng.unit()
+fn value_in_range(signal: &DbcSignal, rng: &mut Rng) -> Result<f64, String> {
+    let (min, max) = signal_range(signal)?;
+    Ok(min + (max - min) * rng.unit())
 }
 
 fn build_profiles(
@@ -221,8 +221,10 @@ fn build_profiles(
                 let values: HashMap<String, f64> = message
                     .signals
                     .iter()
-                    .map(|signal| (signal.name.clone(), value_in_range(signal, rng)))
-                    .collect();
+                    .map(|signal| {
+                        value_in_range(signal, rng).map(|value| (signal.name.clone(), value))
+                    })
+                    .collect::<Result<_, _>>()?;
                 let data = encode_can_message(message.clone(), values.clone())
                     .map_err(|e| format!("Message '{}' cannot be encoded: {e}", message.name))?;
 
@@ -266,7 +268,7 @@ fn churn_payload(profile: &mut Profile, churn: f64, rng: &mut Rng) -> Result<(),
             let mut changed = false;
             for signal in &message.signals {
                 if rng.chance(churn) {
-                    values.insert(signal.name.clone(), value_in_range(signal, rng));
+                    values.insert(signal.name.clone(), value_in_range(signal, rng)?);
                     changed = true;
                 }
             }
@@ -593,7 +595,7 @@ mod tests {
         let message = &dbc.messages[0];
         for frame in &frames {
             for signal in &message.signals {
-                let (min, max) = crate::can::signal_range(signal);
+                let (min, max) = crate::can::signal_range(signal).unwrap();
                 let raw = decode_raw(&frame.data, signal);
                 let value = raw * signal.factor + signal.offset;
                 assert!(
