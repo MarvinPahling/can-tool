@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::can::{self, ensure_no_device, CanFrame, CanState};
-use crate::recording::parse_capture;
+use crate::recording::parse_capture_file;
 use crate::simulation::wait_until;
 
 /// How many frames one replay may hold. A memory bound rather than a format
@@ -32,6 +32,15 @@ use crate::simulation::wait_until;
 /// Deliberately lower than the recorder's own ceiling: a recording is for
 /// analysis as well as replay, and may legitimately be larger than this.
 pub const MAX_REPLAY_FRAMES: usize = 5_000_000;
+
+/// How many source bytes a replay may parse.
+///
+/// This is distinct from `MAX_REPLAY_FRAMES`: the frame cap bounds the retained
+/// `Vec<CanFrame>`, while this cap prevents the old startup peak of a full CSV
+/// `String` plus the parsed frames. 256 MiB leaves headroom for a near-cap
+/// compact capture on commodity machines while rejecting the accidental
+/// multi-gigabyte input before its contents are allocated.
+pub const MAX_REPLAY_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Inserted between the last frame of one pass and the first of the next, so a
 /// repeated capture does not emit two frames claiming the same instant.
@@ -293,8 +302,7 @@ pub fn start_replay(
     // takes in `simulation.rs`, and for the same reason: a replay that dies a
     // third of the way through a file is worse than one that never starts.
     let speed = validate_speed(options.speed)?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-    let capture = parse_capture(&text, MAX_REPLAY_FRAMES)?;
+    let capture = parse_capture_file(&path, MAX_REPLAY_FRAMES, MAX_REPLAY_CAPTURE_BYTES)?;
     if capture.frames.is_empty() {
         return Err(format!("{path} holds no frames to replay"));
     }
