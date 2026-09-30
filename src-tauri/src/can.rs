@@ -692,30 +692,134 @@ fn signal_bit_indices(start_bit: u64, size: u64, little_endian: bool) -> Vec<u64
     indices
 }
 
+const MAX_CAN_DATA_BYTES: u64 = 64;
+const MAX_UNSIGNED_SIGNAL_BITS: u64 = 64;
+const MAX_SIGNED_SIGNAL_BITS: u64 = 63;
+
+fn validate_signal_extent(signal: &DbcSignal, message_bits: u64) -> Result<(), String> {
+    if signal.little_endian {
+        let last_bit = signal
+            .start_bit
+            .checked_add(signal.size - 1)
+            .ok_or_else(|| format!("Signal '{}' bit range overflows u64", signal.name))?;
+        if last_bit >= message_bits {
+            return Err(format!(
+                "Signal '{}' bits {}..={} overflow the {}-byte message",
+                signal.name,
+                signal.start_bit,
+                last_bit,
+                message_bits / 8
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut pos = i64::try_from(signal.start_bit)
+        .map_err(|_| format!("Signal '{}' start bit is too large", signal.name))?;
+    for _ in 0..signal.size {
+        if pos < 0 || pos as u64 >= message_bits {
+            return Err(format!(
+                "Signal '{}' bit {} overflows the {}-byte message",
+                signal.name,
+                pos,
+                message_bits / 8
+            ));
+        }
+        pos = if pos % 8 == 0 { pos + 15 } else { pos - 1 };
+    }
+    Ok(())
+}
+
+fn validate_signal_for_encoding(signal: &DbcSignal, message_bits: u64) -> Result<(), String> {
+    if signal.size == 0 {
+        return Err(format!("Signal '{}' has zero width", signal.name));
+    }
+    if signal.signed && signal.size > MAX_SIGNED_SIGNAL_BITS {
+        return Err(format!(
+            "Signal '{}' is {} signed bits wide; the encoder supports at most {MAX_SIGNED_SIGNAL_BITS}",
+            signal.name, signal.size
+        ));
+    }
+    if !signal.signed && signal.size > MAX_UNSIGNED_SIGNAL_BITS {
+        return Err(format!(
+            "Signal '{}' is {} unsigned bits wide; the encoder supports at most {MAX_UNSIGNED_SIGNAL_BITS}",
+            signal.name, signal.size
+        ));
+    }
+    if !signal.factor.is_finite() || signal.factor == 0.0 {
+        return Err(format!(
+            "Signal '{}' has invalid factor {}; it must be finite and non-zero",
+            signal.name, signal.factor
+        ));
+    }
+    if !signal.offset.is_finite() {
+        return Err(format!(
+            "Signal '{}' has invalid offset {}; it must be finite",
+            signal.name, signal.offset
+        ));
+    }
+    validate_signal_extent(signal, message_bits)
+}
+
+fn validate_message_for_encoding(
+    message: &DbcMessage,
+    values: &HashMap<String, f64>,
+) -> Result<usize, String> {
+    if message.size > MAX_CAN_DATA_BYTES {
+        return Err(format!(
+            "Message '{}' is {} bytes; CAN FD frames support at most {MAX_CAN_DATA_BYTES}",
+            message.name, message.size
+        ));
+    }
+
+    let message_bits = message
+        .size
+        .checked_mul(8)
+        .ok_or_else(|| format!("Message '{}' size is too large", message.name))?;
+    for signal in &message.signals {
+        validate_signal_for_encoding(signal, message_bits)?;
+        if let Some(value) = values.get(&signal.name) {
+            if !value.is_finite() {
+                return Err(format!(
+                    "Signal '{}' value {value} is not finite",
+                    signal.name
+                ));
+            }
+        }
+    }
+
+    usize::try_from(message.size)
+        .map_err(|_| format!("Message '{}' size is too large", message.name))
+}
+
+fn signal_raw_range(signal: &DbcSignal) -> Result<(f64, f64), String> {
+    if signal.signed {
+        let shift = signal.size - 1;
+        let min_raw = -(1i64 << shift);
+        let max_raw = (1i64 << shift) - 1;
+        Ok((min_raw as f64, max_raw as f64))
+    } else {
+        let max_raw = if signal.size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << signal.size) - 1
+        };
+        Ok((0.0, max_raw as f64))
+    }
+}
+
 /// The physical value range a signal can actually encode, derived purely
 /// from its bit width/signedness/factor/offset — not the DBC's declared
 /// min/max. Reverse-engineered DBC files (e.g. opendbc-style) very commonly
 /// leave min/max as an unreliable placeholder like `0|1` regardless of bit
 /// width, so trusting them would reject values that are perfectly encodable.
-pub(crate) fn signal_range(signal: &DbcSignal) -> (f64, f64) {
-    if signal.signed {
-        let min_raw = -(1i64 << (signal.size - 1));
-        let max_raw = (1i64 << (signal.size - 1)) - 1;
-        (
-            min_raw as f64 * signal.factor + signal.offset,
-            max_raw as f64 * signal.factor + signal.offset,
-        )
-    } else {
-        let max_raw = if signal.size >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << signal.size) - 1
-        };
-        (
-            signal.offset,
-            max_raw as f64 * signal.factor + signal.offset,
-        )
-    }
+pub(crate) fn signal_range(signal: &DbcSignal) -> Result<(f64, f64), String> {
+    validate_signal_for_encoding(signal, MAX_CAN_DATA_BYTES * 8)?;
+    let (min_raw, max_raw) = signal_raw_range(signal)?;
+    Ok((
+        min_raw * signal.factor + signal.offset,
+        max_raw * signal.factor + signal.offset,
+    ))
 }
 
 /// Encodes a set of physical signal values into the raw bytes of a CAN
@@ -726,14 +830,15 @@ pub fn encode_can_message(
     message: DbcMessage,
     values: HashMap<String, f64>,
 ) -> Result<Vec<u8>, String> {
-    let mut bytes = vec![0u8; message.size as usize];
+    let byte_len = validate_message_for_encoding(&message, &values)?;
+    let mut bytes = vec![0u8; byte_len];
 
     for signal in &message.signals {
         let Some(&value) = values.get(&signal.name) else {
             continue;
         };
 
-        let (min, max) = signal_range(signal);
+        let (min, max) = signal_range(signal)?;
         if value < min || value > max {
             return Err(format!(
                 "Signal '{}' value {value} is outside [{min}, {max}]",
@@ -744,8 +849,9 @@ pub fn encode_can_message(
         let raw = ((value - signal.offset) / signal.factor).round();
 
         let raw_bits: u64 = if signal.signed {
-            let min_raw = -(1i64 << (signal.size - 1));
-            let max_raw = (1i64 << (signal.size - 1)) - 1;
+            let shift = signal.size - 1;
+            let min_raw = -(1i64 << shift);
+            let max_raw = (1i64 << shift) - 1;
             let raw_i = raw as i64;
             if raw_i < min_raw || raw_i > max_raw {
                 return Err(format!(
@@ -753,9 +859,10 @@ pub fn encode_can_message(
                     signal.name, signal.size
                 ));
             }
-            (raw_i as u64) & ((1u64 << signal.size) - 1)
+            let mask = (1u64 << signal.size) - 1;
+            (raw_i as u64) & mask
         } else {
-            let max_raw = if signal.size >= 64 {
+            let max_raw = if signal.size == 64 {
                 u64::MAX
             } else {
                 (1u64 << signal.size) - 1
@@ -773,12 +880,6 @@ pub fn encode_can_message(
         for (i, &bit_index) in indices.iter().enumerate() {
             let byte_index = (bit_index / 8) as usize;
             let bit_in_byte = (bit_index % 8) as u8;
-            if byte_index >= bytes.len() {
-                return Err(format!(
-                    "Signal '{}' overflows the {}-byte message",
-                    signal.name, message.size
-                ));
-            }
             let bit_value = (raw_bits >> i) & 1;
             if bit_value == 1 {
                 bytes[byte_index] |= 1 << bit_in_byte;
@@ -1620,13 +1721,13 @@ mod tests {
     #[test]
     fn signal_range_unsigned_spans_zero_to_max_raw() {
         let sig = signal(|_| {});
-        assert_eq!(signal_range(&sig), (0.0, 255.0));
+        assert_eq!(signal_range(&sig).unwrap(), (0.0, 255.0));
     }
 
     #[test]
     fn signal_range_signed_is_twos_complement() {
         let sig = signal(|s| s.signed = true);
-        assert_eq!(signal_range(&sig), (-128.0, 127.0));
+        assert_eq!(signal_range(&sig).unwrap(), (-128.0, 127.0));
     }
 
     #[test]
@@ -1635,7 +1736,7 @@ mod tests {
             s.factor = 0.5;
             s.offset = -10.0;
         });
-        assert_eq!(signal_range(&sig), (-10.0, 255.0 * 0.5 - 10.0));
+        assert_eq!(signal_range(&sig).unwrap(), (-10.0, 255.0 * 0.5 - 10.0));
     }
 
     #[test]
@@ -1657,6 +1758,137 @@ mod tests {
 
         let bytes = encode_can_message(msg, values).unwrap();
         assert_eq!(&bytes[..2], &[0x02, 0x01]);
+    }
+
+    #[test]
+    fn encode_can_message_rejects_zero_width_signal_before_packing() {
+        let sig = signal(|s| {
+            s.name = "Empty".to_string();
+            s.size = 0;
+        });
+        let mut values = HashMap::new();
+        values.insert("Empty".to_string(), 0.0);
+
+        let error = encode_can_message(message(vec![sig]), values).unwrap_err();
+
+        assert!(error.contains("Empty"));
+        assert!(error.contains("zero width"));
+    }
+
+    #[test]
+    fn encode_can_message_accepts_maximum_supported_widths() {
+        let unsigned = signal(|s| {
+            s.name = "Unsigned64".to_string();
+            s.size = 64;
+        });
+        let signed = signal(|s| {
+            s.name = "Signed63".to_string();
+            s.start_bit = 0;
+            s.size = 63;
+            s.signed = true;
+        });
+
+        let mut unsigned_values = HashMap::new();
+        unsigned_values.insert("Unsigned64".to_string(), 1.0);
+        assert!(encode_can_message(message(vec![unsigned]), unsigned_values).is_ok());
+
+        let mut signed_values = HashMap::new();
+        signed_values.insert("Signed63".to_string(), -1.0);
+        assert!(encode_can_message(message(vec![signed]), signed_values).is_ok());
+    }
+
+    #[test]
+    fn encode_can_message_rejects_widths_beyond_the_raw_encoder() {
+        let unsigned = signal(|s| {
+            s.name = "Unsigned65".to_string();
+            s.size = 65;
+        });
+        let mut values = HashMap::new();
+        values.insert("Unsigned65".to_string(), 0.0);
+        let error = encode_can_message(message(vec![unsigned]), values).unwrap_err();
+        assert!(error.contains("Unsigned65"));
+        assert!(error.contains("at most 64"));
+
+        let signed = signal(|s| {
+            s.name = "Signed64".to_string();
+            s.size = 64;
+            s.signed = true;
+        });
+        let mut values = HashMap::new();
+        values.insert("Signed64".to_string(), 0.0);
+        let error = encode_can_message(message(vec![signed]), values).unwrap_err();
+        assert!(error.contains("Signed64"));
+        assert!(error.contains("at most 63"));
+    }
+
+    #[test]
+    fn encode_can_message_rejects_oversized_messages_before_allocation() {
+        let sig = signal(|s| s.name = "Val".to_string());
+        let mut msg = message(vec![sig]);
+        msg.size = 65;
+        let mut values = HashMap::new();
+        values.insert("Val".to_string(), 1.0);
+
+        let error = encode_can_message(msg, values).unwrap_err();
+
+        assert!(error.contains("Message"));
+        assert!(error.contains("at most 64"));
+    }
+
+    #[test]
+    fn encode_can_message_rejects_out_of_frame_signal_extents() {
+        let little = signal(|s| {
+            s.name = "Little".to_string();
+            s.start_bit = 60;
+            s.size = 8;
+        });
+        let mut values = HashMap::new();
+        values.insert("Little".to_string(), 1.0);
+        let error = encode_can_message(message(vec![little]), values).unwrap_err();
+        assert!(error.contains("Little"));
+        assert!(error.contains("overflow"));
+
+        let big = signal(|s| {
+            s.name = "Big".to_string();
+            s.start_bit = 56;
+            s.size = 9;
+            s.little_endian = false;
+        });
+        let mut values = HashMap::new();
+        values.insert("Big".to_string(), 1.0);
+        let error = encode_can_message(message(vec![big]), values).unwrap_err();
+        assert!(error.contains("Big"));
+        assert!(error.contains("overflow"));
+    }
+
+    #[test]
+    fn encode_can_message_rejects_non_finite_scale_offset_and_values() {
+        let factor = signal(|s| {
+            s.name = "Factor".to_string();
+            s.factor = f64::NAN;
+        });
+        let mut values = HashMap::new();
+        values.insert("Factor".to_string(), 1.0);
+        let error = encode_can_message(message(vec![factor]), values).unwrap_err();
+        assert!(error.contains("Factor"));
+        assert!(error.contains("factor"));
+
+        let offset = signal(|s| {
+            s.name = "Offset".to_string();
+            s.offset = f64::INFINITY;
+        });
+        let mut values = HashMap::new();
+        values.insert("Offset".to_string(), 1.0);
+        let error = encode_can_message(message(vec![offset]), values).unwrap_err();
+        assert!(error.contains("Offset"));
+        assert!(error.contains("offset"));
+
+        let value = signal(|s| s.name = "Value".to_string());
+        let mut values = HashMap::new();
+        values.insert("Value".to_string(), f64::INFINITY);
+        let error = encode_can_message(message(vec![value]), values).unwrap_err();
+        assert!(error.contains("Value"));
+        assert!(error.contains("not finite"));
     }
 
     #[test]
