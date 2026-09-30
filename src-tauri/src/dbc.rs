@@ -1,4 +1,24 @@
 use can_dbc::{Dbc, MultiplexIndicator, NumericValue};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DBC_PARSE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct DbcParsePermit;
+
+impl DbcParsePermit {
+    fn try_acquire() -> Option<Self> {
+        DBC_PARSE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for DbcParsePermit {
+    fn drop(&mut self) {
+        DBC_PARSE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -107,11 +127,19 @@ impl From<Dbc> for DbcFile {
     }
 }
 
-#[tauri::command]
-pub fn parse_dbc_file(path: String) -> Result<DbcFile, String> {
+fn parse_dbc_file_sync(path: String) -> Result<DbcFile, String> {
     let contents = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let dbc = Dbc::try_from(contents.as_str()).map_err(|e| e.to_string())?;
     Ok(dbc.into())
+}
+
+#[tauri::command]
+pub async fn parse_dbc_file(path: String) -> Result<DbcFile, String> {
+    let _permit = DbcParsePermit::try_acquire()
+        .ok_or_else(|| "A DBC parsing job is already in progress".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || parse_dbc_file_sync(path))
+        .await
+        .map_err(|e| format!("DBC parsing worker failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -143,6 +171,14 @@ BO_ 200 ExtendedMsg: 4 ECU2
     }
 
     #[test]
+    fn only_one_dbc_parse_job_can_be_in_flight() {
+        let first = DbcParsePermit::try_acquire().expect("first parse claims slot");
+        assert!(DbcParsePermit::try_acquire().is_none());
+        drop(first);
+        assert!(DbcParsePermit::try_acquire().is_some());
+    }
+
+    #[test]
     fn converts_each_multiplex_indicator_variant() {
         assert!(matches!(
             DbcMultiplexer::from(MultiplexIndicator::Plain),
@@ -167,7 +203,7 @@ BO_ 200 ExtendedMsg: 4 ECU2
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(SAMPLE_DBC.as_bytes()).unwrap();
 
-        let dbc = parse_dbc_file(file.path().to_string_lossy().into_owned()).unwrap();
+        let dbc = parse_dbc_file_sync(file.path().to_string_lossy().into_owned()).unwrap();
 
         assert_eq!(dbc.version, "1.0");
         assert_eq!(dbc.nodes, vec!["ECU1", "ECU2"]);
@@ -198,7 +234,7 @@ BO_ 200 ExtendedMsg: 4 ECU2
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(SAMPLE_DBC.as_bytes()).unwrap();
 
-        let dbc = parse_dbc_file(file.path().to_string_lossy().into_owned()).unwrap();
+        let dbc = parse_dbc_file_sync(file.path().to_string_lossy().into_owned()).unwrap();
 
         let ext = dbc.messages.iter().find(|m| m.id == 200).unwrap();
         let flag = ext.signals.iter().find(|s| s.name == "Flag").unwrap();
@@ -210,7 +246,7 @@ BO_ 200 ExtendedMsg: 4 ECU2
 
     #[test]
     fn errors_on_missing_file() {
-        let result = parse_dbc_file("/nonexistent/path/does-not-exist.dbc".to_string());
+        let result = parse_dbc_file_sync("/nonexistent/path/does-not-exist.dbc".to_string());
         assert!(result.is_err());
     }
 
@@ -219,7 +255,7 @@ BO_ 200 ExtendedMsg: 4 ECU2
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"this is not a valid dbc file").unwrap();
 
-        let result = parse_dbc_file(file.path().to_string_lossy().into_owned());
+        let result = parse_dbc_file_sync(file.path().to_string_lossy().into_owned());
         assert!(result.is_err());
     }
 }
