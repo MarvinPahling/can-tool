@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::can::{self, ensure_no_device, CanFrame, CanState};
-use crate::recording::parse_capture_file;
+use crate::recording::{parse_capture_file, MAX_CAPTURE_ROW_BYTES};
 use crate::simulation::wait_until;
 
 /// How many frames one replay may hold. A memory bound rather than a format
@@ -41,6 +41,24 @@ pub const MAX_REPLAY_FRAMES: usize = 5_000_000;
 /// compact capture on commodity machines while rejecting the accidental
 /// multi-gigabyte input before its contents are allocated.
 pub const MAX_REPLAY_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Conservative retained-frame budget used to describe what a supported replay
+/// can cost once parsed. It is not a parser limit: `MAX_REPLAY_FRAMES` remains
+/// the user-visible ceiling, and each frame can carry at most 64 bytes of CAN FD
+/// data. The extra 32 bytes per frame covers allocator metadata/slack for the
+/// per-frame payload allocation on common 64-bit allocators, so the documented
+/// supported peak is:
+///
+/// `MAX_REPLAY_CAPTURE_BYTES + MAX_CAPTURE_ROW_BYTES + MAX_REPLAY_RETAINED_BYTES`
+///
+/// On the current 64-bit target `size_of::<CanFrame>()` is 40, making this
+/// retained bound 680,000,000 bytes and the combined bound about 905 MiB. A unit
+/// test pins the arithmetic so a struct-layout change updates this evidence.
+pub const MAX_REPLAY_RETAINED_BYTES: usize =
+    MAX_REPLAY_FRAMES * (std::mem::size_of::<CanFrame>() + 64 + 32);
+
+pub const MAX_REPLAY_SUPPORTED_PEAK_BYTES: usize =
+    MAX_REPLAY_CAPTURE_BYTES as usize + MAX_CAPTURE_ROW_BYTES + MAX_REPLAY_RETAINED_BYTES;
 
 /// Inserted between the last frame of one pass and the first of the next, so a
 /// repeated capture does not emit two frames claiming the same instant.
@@ -450,6 +468,13 @@ mod tests {
                 "{bad} should be refused"
             );
         }
+    }
+
+    #[test]
+    fn supported_peak_memory_bound_is_pinned_to_the_frame_layout() {
+        assert_eq!(std::mem::size_of::<CanFrame>(), 40);
+        assert_eq!(MAX_REPLAY_RETAINED_BYTES, 680_000_000);
+        assert_eq!(MAX_REPLAY_SUPPORTED_PEAK_BYTES, 948_436_480);
     }
 
     #[test]

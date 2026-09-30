@@ -27,6 +27,7 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
+use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +45,13 @@ pub const CAPTURE_HEADER: &str = "timestamp,arbitration_id,is_extended_id,is_fd,
 pub const CAPTURE_LINE_ENDING: &str = "\r\n";
 
 const COLUMNS: usize = 9;
+
+/// Long enough for every valid row (including a CAN FD 64-byte payload) while
+/// keeping a malformed single-line file from becoming the replay's temporary
+/// allocation. The whole-file byte cap remains the source-size bound; this is
+/// the per-row scratch bound that lets the parser reject before appending an
+/// unbounded line to memory.
+pub const MAX_CAPTURE_ROW_BYTES: usize = 1024;
 
 fn at(line_no: usize, message: impl AsRef<str>) -> String {
     format!("Line {line_no}: {}", message.as_ref())
@@ -234,6 +242,61 @@ fn capture_too_large(max_bytes: u64) -> String {
     )
 }
 
+fn row_too_large(line_no: usize) -> String {
+    at(
+        line_no,
+        format!(
+            "capture row is larger than the {MAX_CAPTURE_ROW_BYTES} byte replay row budget. Record a shorter one or trim this one."
+        ),
+    )
+}
+
+fn read_budgeted_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    bytes_read: &mut u64,
+    max_bytes: u64,
+    line_no: usize,
+) -> Result<usize, String> {
+    line.clear();
+
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|e| format!("Cannot read capture: {e}"))?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+
+        let (take, found_line_end) = match available.iter().position(|&byte| byte == b'\n') {
+            Some(index) => (&available[..=index], true),
+            None => (available, false),
+        };
+        let next_total = bytes_read
+            .checked_add(take.len() as u64)
+            .ok_or_else(|| capture_too_large(max_bytes))?;
+        if next_total > max_bytes {
+            return Err(capture_too_large(max_bytes));
+        }
+        if line.len() + take.len() > MAX_CAPTURE_ROW_BYTES {
+            return Err(row_too_large(line_no));
+        }
+
+        line.extend_from_slice(take);
+        *bytes_read = next_total;
+        let consumed = take.len();
+        reader.consume(consumed);
+
+        if found_line_end {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn line_as_str(line: &[u8]) -> Result<&str, String> {
+    str::from_utf8(line).map_err(|e| format!("Cannot read capture: {e}"))
+}
+
 /// Reads a capture from an already-open stream, or explains which line stopped
 /// it.
 ///
@@ -252,35 +315,21 @@ pub fn parse_capture_reader<R: BufRead>(
     max_bytes: u64,
 ) -> Result<Capture, String> {
     let mut bytes_read = 0u64;
-    let mut line = String::new();
+    let mut line = Vec::with_capacity(MAX_CAPTURE_ROW_BYTES.min(256));
 
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(|e| format!("Cannot read capture: {e}"))?;
-    if bytes == 0 {
+    if read_budgeted_line(&mut reader, &mut line, &mut bytes_read, max_bytes, 1)? == 0 {
         return Err("The capture file is empty".to_string());
     }
-    bytes_read += bytes as u64;
-    if bytes_read > max_bytes {
-        return Err(capture_too_large(max_bytes));
-    }
-    check_header(&line)?;
+    check_header(line_as_str(&line)?)?;
 
     let mut frames = Vec::new();
     let mut skipped = 0;
     let mut line_no = 2usize;
     loop {
-        line.clear();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("Cannot read capture: {e}"))?;
-        if bytes == 0 {
+        if read_budgeted_line(&mut reader, &mut line, &mut bytes_read, max_bytes, line_no)? == 0 {
             break;
         }
-        bytes_read += bytes as u64;
-        if bytes_read > max_bytes {
-            return Err(capture_too_large(max_bytes));
-        }
+        let line = line_as_str(&line)?;
 
         // Trailing blank lines are what a CRLF-terminated file looks like to
         // some editors; they are not a malformed row.
@@ -293,7 +342,7 @@ pub fn parse_capture_reader<R: BufRead>(
                 "The capture holds more than {max_frames} frames, which is the most that can be replayed at once. Record a shorter one or trim this one."
             ));
         }
-        match row_to_frame(&line, line_no)? {
+        match row_to_frame(line, line_no)? {
             Some(frame) => frames.push(frame),
             None => skipped += 1,
         }
@@ -912,6 +961,30 @@ mod tests {
         assert!(
             err.contains("byte"),
             "the byte limit should be named, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_capture_reader_rejects_an_oversized_row_at_the_byte_budget() {
+        let text = format!("{CAPTURE_HEADER}\r\n{}", "1".repeat(256));
+        let budget = (CAPTURE_HEADER.len() + CAPTURE_LINE_ENDING.len() + 8) as u64;
+        let err = parse_capture_reader(std::io::Cursor::new(&text), 1_000, budget).unwrap_err();
+        assert!(
+            err.contains("byte"),
+            "a row that crosses the byte budget should be rejected before parsing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_capture_reader_rejects_a_row_past_the_scratch_budget() {
+        let text = format!(
+            "{CAPTURE_HEADER}\r\n{}",
+            "1".repeat(MAX_CAPTURE_ROW_BYTES + 1)
+        );
+        let err = parse_capture_reader(std::io::Cursor::new(&text), 1_000, u64::MAX).unwrap_err();
+        assert!(
+            err.contains("row"),
+            "the per-row scratch limit should be named, got: {err}"
         );
     }
 
