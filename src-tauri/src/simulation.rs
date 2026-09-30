@@ -153,8 +153,11 @@ pub fn cycle_time(period_ms: f64) -> Result<Duration, String> {
         return Err(format!("Period {period_ms} ms must be greater than zero"));
     }
 
-    let cycle = Duration::from_secs_f64(period_ms / 1000.0);
-    Ok(cycle.clamp(MIN_CYCLE, MAX_CYCLE))
+    let bounded_ms = period_ms.clamp(
+        MIN_CYCLE.as_secs_f64() * 1000.0,
+        MAX_CYCLE.as_secs_f64() * 1000.0,
+    );
+    Ok(Duration::from_secs_f64(bounded_ms / 1000.0))
 }
 
 /// One message the frontend wants cycled, as it arrives over IPC.
@@ -672,7 +675,7 @@ mod tests {
 
     #[test]
     fn cycle_time_rejects_a_non_positive_or_non_finite_period() {
-        for period in [0.0, -20.0, f64::NAN, f64::INFINITY] {
+        for period in [0.0, -20.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
                 cycle_time(period).is_err(),
                 "{period} is not a period and must be rejected rather than clamped"
@@ -681,14 +684,27 @@ mod tests {
     }
 
     #[test]
-    fn cycle_time_clamps_to_the_representable_range() {
+    fn cycle_time_clamps_to_the_representable_range_before_converting() {
         assert_eq!(
             cycle_time(0.1).expect("a positive period is valid"),
             MIN_CYCLE,
             "a period under the floor must clamp, not become a busy loop"
         );
         assert_eq!(
-            cycle_time(99_999_999.0).expect("a positive period is valid"),
+            cycle_time(f64::MAX).expect("a huge finite period clamps without panicking"),
+            MAX_CYCLE,
+            "a finite period beyond Duration's range must not panic before it is bounded"
+        );
+    }
+
+    #[test]
+    fn cycle_time_preserves_the_minimum_and_maximum_boundaries() {
+        assert_eq!(
+            cycle_time(MIN_CYCLE.as_secs_f64() * 1000.0).expect("the floor is valid"),
+            MIN_CYCLE
+        );
+        assert_eq!(
+            cycle_time(MAX_CYCLE.as_secs_f64() * 1000.0).expect("the ceiling is valid"),
             MAX_CYCLE
         );
     }
