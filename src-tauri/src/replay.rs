@@ -177,7 +177,43 @@ struct Running {
 /// must be stoppable without touching the connection mutex.
 #[derive(Default)]
 pub struct ReplayState {
-    inner: Mutex<Option<Running>>,
+    inner: Mutex<ReplayInner>,
+}
+
+#[derive(Default)]
+struct ReplayInner {
+    running: Option<Running>,
+    starting: Option<Arc<AtomicBool>>,
+}
+
+impl ReplayState {
+    fn reserve_start(&self) -> Result<Arc<AtomicBool>, String> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if inner.starting.is_some()
+            || inner
+                .running
+                .as_ref()
+                .and_then(|r| r.thread.as_ref())
+                .is_some_and(|t| !t.is_finished())
+        {
+            return Err("A capture replay is already running or starting".to_string());
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        inner.starting = Some(Arc::clone(&cancelled));
+        Ok(cancelled)
+    }
+
+    fn release_start(&self, reservation: &Arc<AtomicBool>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner
+                .starting
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, reservation))
+            {
+                inner.starting = None;
+            }
+        }
+    }
 }
 
 fn poisoned() -> String {
@@ -188,10 +224,12 @@ fn poisoned() -> String {
 /// see there for why one source of `can-frames` at a time is not negotiable.
 pub(crate) fn ensure_not_replaying(state: &ReplayState) -> Result<(), String> {
     let guard = state.inner.lock().map_err(|_| poisoned())?;
-    let running = guard
-        .as_ref()
-        .and_then(|running| running.thread.as_ref())
-        .is_some_and(|thread| !thread.is_finished());
+    let running = guard.starting.is_some()
+        || guard
+            .running
+            .as_ref()
+            .and_then(|running| running.thread.as_ref())
+            .is_some_and(|thread| !thread.is_finished());
 
     if running {
         return Err("A capture replay is running; stop it first".to_string());
@@ -204,7 +242,10 @@ pub(crate) fn ensure_not_replaying(state: &ReplayState) -> Result<(), String> {
 /// the page has to be able to say why a replay ended.
 pub(crate) fn stop_running(state: &ReplayState) -> Result<(), String> {
     let mut guard = state.inner.lock().map_err(|_| poisoned())?;
-    if let Some(running) = guard.as_mut() {
+    if let Some(starting) = &guard.starting {
+        starting.store(true, Ordering::Relaxed);
+    }
+    if let Some(running) = guard.running.as_mut() {
         running.channel.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = running.thread.take() {
             // The wait parks, so an unpark is what makes a stop prompt rather
@@ -216,16 +257,33 @@ pub(crate) fn stop_running(state: &ReplayState) -> Result<(), String> {
     Ok(())
 }
 
-fn install_running(state: &ReplayState, running: Running) -> Result<(), String> {
-    *state.inner.lock().map_err(|_| poisoned())? = Some(running);
+fn commit_start(
+    state: &ReplayState,
+    reservation: &Arc<AtomicBool>,
+    make_running: impl FnOnce() -> Running,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().map_err(|_| poisoned())?;
+    if reservation.load(Ordering::Relaxed)
+        || !inner
+            .starting
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, reservation))
+    {
+        inner.starting = None;
+        return Err("Replay start was cancelled".to_string());
+    }
+    // Spawn and publish while holding the state lock. A concurrent stop either
+    // cancels before this point or observes and stops the fully installed run.
+    inner.running = Some(make_running());
+    inner.starting = None;
     Ok(())
 }
 
 pub(crate) fn replay_status_of(state: &ReplayState) -> Result<ReplayStatus, String> {
     let guard = state.inner.lock().map_err(|_| poisoned())?;
-    let Some(running) = guard.as_ref() else {
+    let Some(running) = guard.running.as_ref() else {
         return Ok(ReplayStatus {
-            running: false,
+            running: guard.starting.is_some(),
             path: None,
             frames_total: 0,
             frames_emitted: 0,
@@ -244,10 +302,11 @@ pub(crate) fn replay_status_of(state: &ReplayState) -> Result<ReplayStatus, Stri
     Ok(ReplayStatus {
         // Derived from the thread rather than the stop flag, so a replay that
         // ran to its end reports itself stopped without anyone asking.
-        running: running
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished()),
+        running: guard.starting.is_some()
+            || running
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished()),
         path: Some(running.path.clone()),
         frames_total: running.frames_total,
         frames_emitted: running.channel.emitted.load(Ordering::Relaxed),
@@ -329,55 +388,65 @@ fn run(app: AppHandle, frames: Vec<CanFrame>, options: ReplayOptions, channel: C
 }
 
 #[tauri::command]
-pub fn start_replay(
+pub async fn start_replay(
     app: AppHandle,
-    replay_state: State<ReplayState>,
+    replay_state: State<'_, ReplayState>,
     path: String,
     options: ReplayOptions,
 ) -> Result<(), String> {
-    // Everything that can be rejected is rejected before any state is touched
-    // and before a single frame is emitted — the posture `validate_entries`
-    // takes in `simulation.rs`, and for the same reason: a replay that dies a
-    // third of the way through a file is worse than one that never starts.
+    // Reserve before dispatch so repeated IPC requests cannot queue unbounded
+    // parsers on the blocking pool. Stop can cancel this reservation while the
+    // worker is reading/parsing the capture.
     let speed = validate_speed(options.speed)?;
-    let capture = parse_capture_file_with_memory_budget(
-        &path,
-        MAX_REPLAY_FRAMES,
-        MAX_REPLAY_CAPTURE_BYTES,
-        MAX_REPLAY_SUPPORTED_PEAK_BYTES,
-    )?;
-    if capture.frames.is_empty() {
-        return Err(format!("{path} holds no frames to replay"));
-    }
-
-    // Checked while holding nothing, so this nests no locks: the documented
-    // order is about nesting, and a device check that failed *after* tearing
-    // down a running replay would cost the user their measurement.
     ensure_no_device(&app.state::<CanState>())?;
-    stop_running(&replay_state)?;
-
-    let channel = Channel::default();
-    let frames_total = capture.frames.len() as u64;
-    let options = ReplayOptions {
+    let reservation = replay_state.reserve_start()?;
+    let app_for_worker = app.clone();
+    let worker_reservation = Arc::clone(&reservation);
+    let worker_options = ReplayOptions {
         speed,
         repeat: options.repeat,
     };
 
-    let thread = {
-        let channel = channel.clone();
-        let app = app.clone();
-        thread::spawn(move || run(app, capture.frames, options, channel))
-    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_worker.state::<ReplayState>();
+        let result = (|| {
+            let capture = parse_capture_file_with_memory_budget(
+                &path,
+                MAX_REPLAY_FRAMES,
+                MAX_REPLAY_CAPTURE_BYTES,
+                MAX_REPLAY_SUPPORTED_PEAK_BYTES,
+            )?;
+            if capture.frames.is_empty() {
+                return Err(format!("{path} holds no frames to replay"));
+            }
+            if worker_reservation.load(Ordering::Relaxed) {
+                return Err("Replay start was cancelled".to_string());
+            }
+            ensure_no_device(&app_for_worker.state::<CanState>())?;
 
-    install_running(
-        &replay_state,
-        Running {
-            thread: Some(thread),
-            channel,
-            path,
-            frames_total,
-        },
-    )
+            let frames_total = capture.frames.len() as u64;
+            commit_start(&state, &worker_reservation, || {
+                let channel = Channel::default();
+                let thread = {
+                    let channel = channel.clone();
+                    let app = app_for_worker.clone();
+                    thread::spawn(move || run(app, capture.frames, worker_options, channel))
+                };
+                Running {
+                    thread: Some(thread),
+                    channel,
+                    path,
+                    frames_total,
+                }
+            })
+        })();
+        if result.is_err() {
+            state.release_start(&worker_reservation);
+        }
+        result
+    })
+    .await
+    .map_err(|e| format!("Replay worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -506,6 +575,37 @@ mod tests {
     }
 
     #[test]
+    fn replay_parse_reservation_rejects_overlapping_starts_and_can_be_released() {
+        let state = ReplayState::default();
+        let reservation = state.reserve_start().expect("first start reserves");
+        assert!(
+            state.reserve_start().is_err(),
+            "overlapping starts are bounded"
+        );
+        state.release_start(&reservation);
+        assert!(state.reserve_start().is_ok());
+    }
+
+    #[test]
+    fn replay_status_reports_a_parse_reservation_as_starting() {
+        let state = ReplayState::default();
+        let _reservation = state.reserve_start().unwrap();
+        let status = replay_status_of(&state).unwrap();
+        assert!(status.running);
+        assert_eq!(status.path, None);
+        assert_eq!(status.frames_total, 0);
+    }
+
+    #[test]
+    fn stop_cancels_a_replay_while_its_capture_is_being_parsed() {
+        let state = ReplayState::default();
+        let reservation = state.reserve_start().expect("start reserves");
+        stop_running(&state).unwrap();
+        assert!(reservation.load(Ordering::Relaxed));
+        state.release_start(&reservation);
+    }
+
+    #[test]
     fn ensure_not_replaying_passes_when_nothing_is_running() {
         assert!(ensure_not_replaying(&ReplayState::default()).is_ok());
     }
@@ -525,15 +625,13 @@ mod tests {
                 }
             })
         };
-        install_running(
-            &state,
-            Running {
-                thread: Some(thread),
-                channel,
-                path: "capture.csv".to_string(),
-                frames_total: 3,
-            },
-        )
+        let reservation = state.reserve_start().unwrap();
+        commit_start(&state, &reservation, || Running {
+            thread: Some(thread),
+            channel,
+            path: "capture.csv".to_string(),
+            frames_total: 3,
+        })
         .unwrap();
 
         let err = ensure_not_replaying(&state).unwrap_err();

@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 
@@ -37,6 +38,24 @@ const SYNTHETIC_EPOCH_MS: f64 = 1_800_000_000_000.0;
 
 /// Ceiling on one generated file. Roughly a gigabyte of CSV.
 const MAX_GENERATED_FRAMES: u64 = 15_000_000;
+static GENERATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct GenerationPermit;
+
+impl GenerationPermit {
+    fn try_acquire() -> Option<Self> {
+        GENERATION_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for GenerationPermit {
+    fn drop(&mut self) {
+        GENERATION_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 /// What to generate. Every axis here is one the live view is sensitive to.
 #[derive(Deserialize, Clone)]
@@ -329,24 +348,30 @@ pub(crate) fn generate_into<W: Write>(spec: &CaptureSpec, out: &mut W) -> Result
 }
 
 #[tauri::command]
-pub fn generate_capture(path: String, spec: CaptureSpec) -> Result<RecordingSummary, String> {
-    // Checked before the file is created, so a bad spec does not leave an
-    // empty capture behind.
-    validate_spec(&spec)?;
+pub async fn generate_capture(path: String, spec: CaptureSpec) -> Result<RecordingSummary, String> {
+    let _permit = GenerationPermit::try_acquire()
+        .ok_or_else(|| "A capture generation job is already in progress".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Checked before the file is created, so a bad spec does not leave an
+        // empty capture behind.
+        validate_spec(&spec)?;
 
-    let file = File::create(&path).map_err(|e| format!("Cannot write {path}: {e}"))?;
-    let mut writer = BufWriter::new(file);
-    let frames = generate_into(&spec, &mut writer)?;
-    writer
-        .flush()
-        .map_err(|e| format!("Cannot write {path}: {e}"))?;
+        let file = File::create(&path).map_err(|e| format!("Cannot write {path}: {e}"))?;
+        let mut writer = BufWriter::new(file);
+        let frames = generate_into(&spec, &mut writer)?;
+        writer
+            .flush()
+            .map_err(|e| format!("Cannot write {path}: {e}"))?;
 
-    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok(RecordingSummary {
-        path,
-        frames,
-        bytes,
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Ok(RecordingSummary {
+            path,
+            frames,
+            bytes,
+        })
     })
+    .await
+    .map_err(|e| format!("Capture generation worker failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -381,6 +406,33 @@ mod tests {
         parse_capture(text, 1_000_000)
             .expect("a valid capture")
             .frames
+    }
+
+    #[test]
+    fn a_blocked_generation_worker_does_not_block_async_runtime_progress() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let task = tauri::async_runtime::spawn(async move {
+            let worker = tauri::async_runtime::spawn_blocking(move || {
+                release_rx.recv().expect("test releases worker");
+            });
+            progress_tx.send(()).expect("test is waiting");
+            worker.await.expect("blocking worker completes");
+        });
+
+        progress_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("runtime task progresses while generation worker is blocked");
+        release_tx.send(()).unwrap();
+        tauri::async_runtime::block_on(async { task.await.unwrap() });
+    }
+
+    #[test]
+    fn only_one_capture_generation_job_can_be_in_flight() {
+        let first = GenerationPermit::try_acquire().expect("first generation claims slot");
+        assert!(GenerationPermit::try_acquire().is_none());
+        drop(first);
+        assert!(GenerationPermit::try_acquire().is_some());
     }
 
     #[test]
