@@ -23,7 +23,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::can::{self, ensure_no_device, CanFrame, CanState};
-use crate::recording::{parse_capture_file, MAX_CAPTURE_ROW_BYTES};
+use crate::recording::parse_capture_file_with_memory_budget;
+#[cfg(test)]
+use crate::recording::{
+    MAX_CAPTURE_ROW_BYTES, REPLAY_FRAME_ALLOCATION_CHUNK, REPLAY_FRAME_PAYLOAD_ALLOCATION_BYTES,
+    REPLAY_READER_BUFFER_BYTES, REPLAY_ROW_PARSE_SCRATCH_BYTES,
+};
 use crate::simulation::wait_until;
 
 /// How many frames one replay may hold. A memory bound rather than a format
@@ -42,23 +47,38 @@ pub const MAX_REPLAY_FRAMES: usize = 5_000_000;
 /// multi-gigabyte input before its contents are allocated.
 pub const MAX_REPLAY_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Conservative retained-frame budget used to describe what a supported replay
-/// can cost once parsed. It is not a parser limit: `MAX_REPLAY_FRAMES` remains
-/// the user-visible ceiling, and each frame can carry at most 64 bytes of CAN FD
-/// data. The extra 32 bytes per frame covers allocator metadata/slack for the
-/// per-frame payload allocation on common 64-bit allocators, so the documented
-/// supported peak is:
-///
-/// `MAX_REPLAY_CAPTURE_BYTES + MAX_CAPTURE_ROW_BYTES + MAX_REPLAY_RETAINED_BYTES`
-///
-/// On the current 64-bit target `size_of::<CanFrame>()` is 40, making this
-/// retained bound 680,000,000 bytes and the combined bound about 905 MiB. A unit
-/// test pins the arithmetic so a struct-layout change updates this evidence.
-pub const MAX_REPLAY_RETAINED_BYTES: usize =
-    MAX_REPLAY_FRAMES * (std::mem::size_of::<CanFrame>() + 64 + 32);
+/// Enforced upper bound for replay parsing plus the retained timing schedule.
+/// The parser checks it before each frame allocation. It conservatively counts
+/// the full allowed source size, 8 KiB reader buffer, row buffer plus bounded
+/// row-parse scratch, the old and new frame-vector capacities during a chunked
+/// reallocation, up to 80 bytes per frame for payload allocation/allocator
+/// overhead, and one Duration offset per frame. Chunks are 4096 frames; small
+/// captures allocate only the first chunk (or the smaller frame ceiling), not
+/// the full frame ceiling.
+pub const MAX_REPLAY_SUPPORTED_PEAK_BYTES: u64 = 1_342_177_280; // 1.25 GiB
 
-pub const MAX_REPLAY_SUPPORTED_PEAK_BYTES: usize =
-    MAX_REPLAY_CAPTURE_BYTES as usize + MAX_CAPTURE_ROW_BYTES + MAX_REPLAY_RETAINED_BYTES;
+#[cfg(test)]
+const fn previous_frame_capacity(frame_limit: usize) -> usize {
+    if frame_limit <= REPLAY_FRAME_ALLOCATION_CHUNK {
+        0
+    } else {
+        ((frame_limit - 1) / REPLAY_FRAME_ALLOCATION_CHUNK) * REPLAY_FRAME_ALLOCATION_CHUNK
+    }
+}
+
+#[cfg(test)]
+const fn supported_peak_estimate() -> u64 {
+    let frames = MAX_REPLAY_FRAMES as u64;
+    let previous_capacity = previous_frame_capacity(MAX_REPLAY_FRAMES) as u64;
+    let transient_frame_capacity = frames + previous_capacity;
+    MAX_REPLAY_CAPTURE_BYTES
+        + REPLAY_READER_BUFFER_BYTES as u64
+        + MAX_CAPTURE_ROW_BYTES as u64
+        + REPLAY_ROW_PARSE_SCRATCH_BYTES as u64
+        + transient_frame_capacity * std::mem::size_of::<CanFrame>() as u64
+        + frames * REPLAY_FRAME_PAYLOAD_ALLOCATION_BYTES as u64
+        + frames * std::mem::size_of::<Duration>() as u64
+}
 
 /// Inserted between the last frame of one pass and the first of the next, so a
 /// repeated capture does not emit two frames claiming the same instant.
@@ -320,7 +340,12 @@ pub fn start_replay(
     // takes in `simulation.rs`, and for the same reason: a replay that dies a
     // third of the way through a file is worse than one that never starts.
     let speed = validate_speed(options.speed)?;
-    let capture = parse_capture_file(&path, MAX_REPLAY_FRAMES, MAX_REPLAY_CAPTURE_BYTES)?;
+    let capture = parse_capture_file_with_memory_budget(
+        &path,
+        MAX_REPLAY_FRAMES,
+        MAX_REPLAY_CAPTURE_BYTES,
+        MAX_REPLAY_SUPPORTED_PEAK_BYTES,
+    )?;
     if capture.frames.is_empty() {
         return Err(format!("{path} holds no frames to replay"));
     }
@@ -471,10 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn supported_peak_memory_bound_is_pinned_to_the_frame_layout() {
+    fn supported_peak_memory_bound_includes_growth_and_replay_offsets() {
         assert_eq!(std::mem::size_of::<CanFrame>(), 40);
-        assert_eq!(MAX_REPLAY_RETAINED_BYTES, 680_000_000);
-        assert_eq!(MAX_REPLAY_SUPPORTED_PEAK_BYTES, 948_436_480);
+        assert_eq!(MAX_REPLAY_SUPPORTED_PEAK_BYTES, 1_342_177_280);
+        assert_eq!(previous_frame_capacity(4_097), 4_096);
+        assert_eq!(previous_frame_capacity(MAX_REPLAY_FRAMES), 4_997_120);
+        assert_eq!(supported_peak_estimate(), 1_148_330_112);
+        assert!(supported_peak_estimate() <= MAX_REPLAY_SUPPORTED_PEAK_BYTES);
     }
 
     #[test]

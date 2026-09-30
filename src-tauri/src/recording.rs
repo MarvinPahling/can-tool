@@ -45,6 +45,10 @@ pub const CAPTURE_HEADER: &str = "timestamp,arbitration_id,is_extended_id,is_fd,
 pub const CAPTURE_LINE_ENDING: &str = "\r\n";
 
 const COLUMNS: usize = 9;
+pub(crate) const REPLAY_FRAME_ALLOCATION_CHUNK: usize = 4096;
+pub(crate) const REPLAY_READER_BUFFER_BYTES: usize = 8 * 1024;
+pub(crate) const REPLAY_FRAME_PAYLOAD_ALLOCATION_BYTES: usize = 64 + 16;
+pub(crate) const REPLAY_ROW_PARSE_SCRATCH_BYTES: usize = 128 + MAX_CAPTURE_ROW_BYTES / 2;
 
 /// Long enough for every valid row (including a CAN FD 64-byte payload) while
 /// keeping a malformed single-line file from becoming the replay's temporary
@@ -293,6 +297,47 @@ fn read_budgeted_line<R: BufRead>(
     }
 }
 
+fn ensure_capture_memory_budget(
+    budget: u64,
+    source_budget: u64,
+    row_capacity: usize,
+    frame_capacity: usize,
+    frame_count: usize,
+    line_no: usize,
+) -> Result<(), String> {
+    if budget == u64::MAX {
+        return Ok(());
+    }
+    let bytes = source_budget
+        .checked_add(REPLAY_READER_BUFFER_BYTES as u64)
+        .and_then(|n| n.checked_add(row_capacity as u64))
+        .and_then(|n| n.checked_add(REPLAY_ROW_PARSE_SCRATCH_BYTES as u64))
+        .and_then(|n| {
+            n.checked_add(
+                (frame_capacity as u64).checked_mul(std::mem::size_of::<CanFrame>() as u64)?,
+            )
+        })
+        .and_then(|n| {
+            n.checked_add(
+                (frame_count as u64).checked_mul(REPLAY_FRAME_PAYLOAD_ALLOCATION_BYTES as u64)?,
+            )
+        })
+        .and_then(|n| {
+            n.checked_add(
+                (frame_count as u64)
+                    .checked_mul(std::mem::size_of::<std::time::Duration>() as u64)?,
+            )
+        })
+        .ok_or_else(|| at(line_no, "replay memory accounting overflow"))?;
+    if bytes > budget {
+        return Err(at(
+            line_no,
+            format!("capture exceeds the {budget} byte combined replay memory budget"),
+        ));
+    }
+    Ok(())
+}
+
 fn line_as_str(line: &[u8]) -> Result<&str, String> {
     str::from_utf8(line).map_err(|e| format!("Cannot read capture: {e}"))
 }
@@ -310,10 +355,27 @@ fn line_as_str(line: &[u8]) -> Result<&str, String> {
 /// unbounded allocation on the way there. A recording may legally be larger
 /// than anything that can be replayed in one go.
 pub fn parse_capture_reader<R: BufRead>(
-    mut reader: R,
+    reader: R,
     max_frames: usize,
     max_bytes: u64,
 ) -> Result<Capture, String> {
+    parse_capture_reader_with_memory_budget(reader, max_frames, max_bytes, u64::MAX)
+}
+
+pub fn parse_capture_reader_with_memory_budget<R: BufRead>(
+    mut reader: R,
+    max_frames: usize,
+    max_bytes: u64,
+    max_memory_bytes: u64,
+) -> Result<Capture, String> {
+    ensure_capture_memory_budget(
+        max_memory_bytes,
+        max_bytes,
+        MAX_CAPTURE_ROW_BYTES.min(256),
+        0,
+        0,
+        1,
+    )?;
     let mut bytes_read = 0u64;
     let mut line = Vec::with_capacity(MAX_CAPTURE_ROW_BYTES.min(256));
 
@@ -329,6 +391,7 @@ pub fn parse_capture_reader<R: BufRead>(
         if read_budgeted_line(&mut reader, &mut line, &mut bytes_read, max_bytes, line_no)? == 0 {
             break;
         }
+        let line_capacity = line.capacity();
         let line = line_as_str(&line)?;
 
         // Trailing blank lines are what a CRLF-terminated file looks like to
@@ -342,8 +405,51 @@ pub fn parse_capture_reader<R: BufRead>(
                 "The capture holds more than {max_frames} frames, which is the most that can be replayed at once. Record a shorter one or trim this one."
             ));
         }
+        let will_add_frame = !line.split(',').nth(5).is_some_and(|error| error == "1");
+        let next_count = frames.len() + usize::from(will_add_frame);
+        let next_capacity = if will_add_frame && next_count > frames.capacity() {
+            next_count.max(
+                frames
+                    .capacity()
+                    .saturating_add(REPLAY_FRAME_ALLOCATION_CHUNK)
+                    .min(max_frames),
+            )
+        } else {
+            frames.capacity()
+        };
+        let peak_capacity = if next_capacity > frames.capacity() {
+            frames.capacity().saturating_add(next_capacity)
+        } else {
+            next_capacity
+        };
+        ensure_capture_memory_budget(
+            max_memory_bytes,
+            max_bytes,
+            line_capacity,
+            peak_capacity,
+            next_count,
+            line_no,
+        )?;
         match row_to_frame(line, line_no)? {
-            Some(frame) => frames.push(frame),
+            Some(frame) => {
+                if frames.len() == frames.capacity() {
+                    let previous_capacity = frames.capacity();
+                    frames
+                        .try_reserve_exact(next_capacity - frames.len())
+                        .map_err(|e| at(line_no, format!("cannot allocate replay frames: {e}")))?;
+                    if frames.capacity() > next_capacity {
+                        ensure_capture_memory_budget(
+                            max_memory_bytes,
+                            max_bytes,
+                            line_capacity,
+                            previous_capacity.saturating_add(frames.capacity()),
+                            next_count,
+                            line_no,
+                        )?;
+                    }
+                }
+                frames.push(frame);
+            }
             None => skipped += 1,
         }
         line_no += 1;
@@ -371,6 +477,36 @@ pub fn parse_capture_file(
     }
 
     parse_capture_reader(BufReader::new(file), max_frames, max_bytes)
+}
+
+pub fn parse_capture_file_with_memory_budget(
+    path: &str,
+    max_frames: usize,
+    max_bytes: u64,
+    max_memory_bytes: u64,
+) -> Result<Capture, String> {
+    let file = File::open(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Cannot read {path}: {e}"))?;
+    if metadata.len() > max_bytes {
+        return Err(capture_too_large(max_bytes));
+    }
+
+    ensure_capture_memory_budget(
+        max_memory_bytes,
+        max_bytes,
+        MAX_CAPTURE_ROW_BYTES.min(256),
+        0,
+        0,
+        1,
+    )?;
+    parse_capture_reader_with_memory_budget(
+        BufReader::new(file),
+        max_frames,
+        max_bytes,
+        max_memory_bytes,
+    )
 }
 
 /// Reads a whole capture from an in-memory string.
@@ -939,6 +1075,36 @@ mod tests {
             err.contains('3'),
             "the message must say what the limit is, got: {err}"
         );
+    }
+
+    #[test]
+    fn combined_memory_budget_accounts_for_source_scratch_frame_capacity_payload_and_offsets() {
+        let text = format!("{CAPTURE_HEADER}\r\n1.0,0x1A0,0,0,0,0,0,0,\r\n");
+        let expected = text.len() as u64
+            + REPLAY_READER_BUFFER_BYTES as u64
+            + MAX_CAPTURE_ROW_BYTES.min(256) as u64
+            + 2 * std::mem::size_of::<CanFrame>() as u64
+            + REPLAY_FRAME_PAYLOAD_ALLOCATION_BYTES as u64
+            + REPLAY_ROW_PARSE_SCRATCH_BYTES as u64
+            + std::mem::size_of::<std::time::Duration>() as u64;
+        let parsed = parse_capture_reader_with_memory_budget(
+            std::io::Cursor::new(&text),
+            2,
+            text.len() as u64,
+            expected,
+        )
+        .unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+
+        let err = parse_capture_reader_with_memory_budget(
+            std::io::Cursor::new(&text),
+            2,
+            text.len() as u64,
+            expected - 1,
+        )
+        .unwrap_err();
+        assert!(err.contains("Line 2"), "got: {err}");
+        assert!(err.contains("combined replay memory budget"), "got: {err}");
     }
 
     #[test]
