@@ -816,10 +816,15 @@ fn signal_raw_range(signal: &DbcSignal) -> Result<(f64, f64), String> {
 pub(crate) fn signal_range(signal: &DbcSignal) -> Result<(f64, f64), String> {
     validate_signal_for_encoding(signal, MAX_CAN_DATA_BYTES * 8)?;
     let (min_raw, max_raw) = signal_raw_range(signal)?;
-    Ok((
-        min_raw * signal.factor + signal.offset,
-        max_raw * signal.factor + signal.offset,
-    ))
+    let min = min_raw * signal.factor + signal.offset;
+    let max = max_raw * signal.factor + signal.offset;
+    if !min.is_finite() || !max.is_finite() {
+        return Err(format!(
+            "Signal '{}' physical range is not finite",
+            signal.name
+        ));
+    }
+    Ok((min.min(max), min.max(max)))
 }
 
 /// Encodes a set of physical signal values into the raw bytes of a CAN
@@ -1737,6 +1742,22 @@ mod tests {
             s.offset = -10.0;
         });
         assert_eq!(signal_range(&sig).unwrap(), (-10.0, 255.0 * 0.5 - 10.0));
+    }
+
+    #[test]
+    fn negative_factor_range_is_ordered_and_round_trips() {
+        let sig = signal(|s| {
+            s.name = "Negative".to_string();
+            s.factor = -0.5;
+            s.offset = 10.0;
+        });
+        assert_eq!(signal_range(&sig).unwrap(), (-117.5, 10.0));
+
+        let msg = message(vec![sig.clone()]);
+        let mut values = HashMap::new();
+        values.insert("Negative".to_string(), -5.0);
+        let bytes = encode_can_message(msg.clone(), values).unwrap();
+        assert_eq!(bytes[0], 30); // raw 30 maps to -5 with factor -0.5 and offset 10.
     }
 
     #[test]
